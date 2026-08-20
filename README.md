@@ -87,6 +87,10 @@ Die Konfiguration ist auf den kleinen Testtarif ausgerichtet:
 - Nur ein Chromium-Renderer-Prozess und nur ein Avatar gleichzeitig.
 - 640×640, Device Scale 1, kein Post Processing und kein Hidden Surface Removal.
 - Layered-Clothing-Worker sind deaktiviert, damit keine Parallel-Last entsteht.
+- **Kein permanenter WebGL-Renderloop:** WebGL läuft in der Cloud über SwiftShader (reines Software-Rendering). Ein fortlaufender `requestAnimationFrame`-Loop würde auf 0,1 CPU den kompletten Browser-Thread blockieren, sodass Downloads und Mesh-Parsing verhungern und jeder Render ins Zeitlimit läuft. Der Renderer zeichnet deshalb genau **einen finalen Frame**, nachdem alle Assets kompiliert sind.
+- **Harte Zeitlimits pro Anfrage:** Jeder Asset-Download im Renderer hat ein 60-Sekunden-Limit (über den Proxy). Ein einzelner hängender Request blockiert nie den ganzen Render.
+- **Fortschritts-Watchdog:** Bleibt der Render 240 s ohne jede Bewegung in einer Phase hängen, bricht er mit einer konkreten Fehlermeldung ab (Phase + zuletzt geladenes Asset) statt 420 s lang still zu warten.
+- **Phasen-Logs:** Jede Render-Phase wird mit Laufzeit in den Server-Logs protokolliert (`[render] userId=… Phase assets – … (+42 s)`). Bei einem Timeout nennt die Discord-Antwort die letzte Phase.
 - Node-Heap ist im Container auf 160 MB begrenzt.
 - Jeder einzelne Proxy-Download ist standardmäßig auf 30 MB begrenzt.
 - Render-Timeout: 420 Sekunden.
@@ -189,6 +193,18 @@ npm start
 ```
 
 Der produktive Server liest `.env` nicht automatisch. Lokal die Werte in der Shell exportieren; bei Render werden sie im Dashboard gesetzt.
+
+## Troubleshooting: „Der Render hat das Zeitlimit überschritten“
+
+Der Fehler kommt mit Zusatzinfo, z. B. `… (letzte Phase: „assets“, zuletzt: „Originale Roblox-Assets und Meshes werden geladen …“)`. So liest man das:
+
+- **`browser`** – Chromium selbst ist nicht gestartet. Render-Logs prüfen (`[render]`), meist Speicher-Problem beim Start.
+- **`setup`** – WebGL2-Kontext konnte nicht erstellt werden. Sehr unwahrscheinlich mit SwiftShader; Render-Logs prüfen.
+- **`profile`** – `avatar.roblox.com` nicht erreichbar oder der User blockiert die Avatar-Auskunft.
+- **`assets`** – Ein Asset-Download hängt oder scheitert (Roblox-Rate-Limit, moderiert/gelöscht, zu groß). In den Logs steht dank Fortschritts-Watchdog nach 240 s das konkrete Asset: `Kein Fortschritt … (zuletzt geladen: getAssetBufferInternal-rbxassetid://123…)`.
+- **`finalize`** – Szene war fertig, aber das finale Bild konnte nicht gezeichnet werden (Speicher).
+
+Alle Phasen werden mit Laufzeit geloggt (`[render] userId=… Phase … (+42 s)`), sodass man in den Render-Logs genau sieht, wo die Zeit hingeht. Ergänzend kann es die Fehlermeldung `Chromium ist während des Renders abgestürzt` geben — das ist praktisch immer das Speicherlimit des freien Tarifs.
 
 ## Verhalten und Grenzen
 
