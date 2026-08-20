@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: roblox-avatar-render-bot
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    numInstances: 1
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: DISCORD_APPLICATION_ID
+        sync: false
+      - key: DISCORD_GUILD_ID
+        sync: false
+      - key: RENDER_TIMEOUT_SECONDS
+        value: "420"
+      - key: MAX_ASSET_MB
+        value: "30"
