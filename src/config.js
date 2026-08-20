@@ -14,6 +14,10 @@ export const config = {
   renderTimeoutMs: integer("RENDER_TIMEOUT_SECONDS", 420, 60, 840) * 1000,
   chromiumPath: process.env.CHROMIUM_PATH || "/usr/bin/chromium",
   maxProxyBytes: integer("MAX_ASSET_MB", 30, 5, 60) * 1024 * 1024,
+  restTimeoutMs: integer("REST_TIMEOUT_SECONDS", 30, 5, 300) * 1000,
+  loginTimeoutMs: integer("LOGIN_TIMEOUT_SECONDS", 60, 10, 600) * 1000,
+  healthRequireDiscord: (process.env.HEALTH_REQUIRE_DISCORD ?? "true") !== "false",
+  debug: process.env.DISCORD_DEBUG === "true",
 };
 
 export function validateBotConfig() {

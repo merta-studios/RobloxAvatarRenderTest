@@ -15,7 +15,8 @@ Ein ressourcenschonender Discord-Bot für `/render_avatar username:<USERNAME>`. 
 - globaler In-Process-Lock: immer nur **ein** Render gleichzeitig
 - sofortige, private Ablehnung weiterer Aufträge
 - Zeitlimits, Asset-Größenlimit, eingeschränkter Roblox-Proxy und garantierte Browser-Bereinigung
-- `/health` für Render
+- `/health` für Render, abhängig vom Discord-Verbindungsstatus
+- ausführliche Diagnose-Logs mit Zeitstempel und Phasen-Tags (`[login]`, `[gateway]`, `[commands]`, …)
 
 ## Warum nicht „Avatar als OBJ herunterladen“?
 
@@ -60,7 +61,7 @@ Der Bot braucht **keinen Roblox-Cookie**. Niemals `.ROBLOSECURITY` als Environme
 | `DISCORD_GUILD_ID` | ID des Testservers (empfohlen) |
 
 5. Deploy starten.
-6. In den Logs müssen nacheinander `HTTP: Port ...`, `Discord-Command registriert` und `Discord: eingeloggt als ...` erscheinen.
+6. In den Logs müssen nacheinander `[http] HTTP: Port …`, `[login] Verbinde mit dem Discord-Gateway …`, `[gateway] Discord: eingeloggt als …` und `[commands] … Command(s) registriert …` erscheinen. **Der Gateway-Login passiert bewusst vor der Command-Registrierung** – erst wenn der Bot online ist, wird per REST registriert.
 7. Auf dem Testserver `/render_avatar username:Builderman` ausprobieren.
 
 Mit `DISCORD_GUILD_ID` erscheint der Command normalerweise sofort. Ohne diese Variable wird er global registriert; globale Discord-Commands können verzögert sichtbar werden.
@@ -105,6 +106,35 @@ Siehe `.env.example`.
 | `CHROMIUM_PATH` | nein | `/usr/bin/chromium` | Chromium im Docker-Image |
 | `RENDER_TIMEOUT_SECONDS` | nein | `420` | 60–840 Sekunden |
 | `MAX_ASSET_MB` | nein | `30` | Maximalgröße je Roblox-Asset, 5–60 MB |
+| `REST_TIMEOUT_SECONDS` | nein | `30` | Timeout pro REST-Anfrage, 5–300 Sekunden |
+| `LOGIN_TIMEOUT_SECONDS` | nein | `60` | Maximale Zeit für den Gateway-Login, 10–600 Sekunden |
+| `HEALTH_REQUIRE_DISCORD` | nein | `true` | `/health` antwortet mit 503, solange der Bot nicht mit Discord verbunden ist |
+| `DISCORD_DEBUG` | nein | `false` | Ausführliche Debug-Logs von discord.js (REST/WebSocket) |
+
+## Startreihenfolge, Timeouts und Diagnose
+
+Beim Start passiert Folgendes – jede Phase loggt mit eigenem Tag und Zeitstempel:
+
+1. **`[http]`** Der HTTP-Server öffnet den Port, damit der Render-Healthcheck erreichbar ist.
+2. **`[login]`** Der Bot verbindet sich zuerst mit dem **Discord-Gateway**. Schlägt der Login fehl oder dauert er länger als `LOGIN_TIMEOUT_SECONDS`, wird der Prozess mit Fehlercode 1 beendet, damit Render den Container neu starten kann. So hängt der Bot nie lautlos fest.
+3. **`[commands]`** Erst nach erfolgreichem Login wird der Slash-Command per REST registriert. Jede einzelne REST-Anfrage hat ein Timeout (`REST_TIMEOUT_SECONDS`), die gesamte Registrierung zusätzlich eine harte Deadline (3 Versuche à Timeout plus Puffer). Scheitert die Registrierung, **bleibt der Bot online** und der Fehler ist in Logs und `/health` sichtbar.
+
+Gateway-Ereignisse (Reconnect, Disconnect, Shard-Fehler, Warnungen) werden unter `[gateway]` bzw. `[discord]` geloggt. Mit `DISCORD_DEBUG=true` kommen die rohen discord.js-Debug-Logs hinzu; Fehler werden dann zusätzlich mit allen Details ausgegeben. Bot-Tokens werden in Logs und Health-Antworten grundsätzlich geschwärzt (`[REDACTED]`).
+
+**Healthcheck:** `GET /health` liefert standardmäßig **503**, solange der Bot nicht mit Discord verbunden ist, und **200**, sobald er bereit ist. Die Antwort enthält den Discord-Status (User, Ping, Gateway, letzter Fehler) sowie den Stand der Command-Registrierung:
+
+```json
+{
+  "ok": true,
+  "busy": false,
+  "job": null,
+  "uptime": 42,
+  "discord": { "ready": true, "status": "ready", "user": "MeinBot#0000", "ping": 41, "lastError": null },
+  "commands": { "state": "registered", "target": "Guild 123", "count": 1, "durationMs": 812 }
+}
+```
+
+Damit markiert Render den Service als ungesund, wenn der Bot nicht online ist – statt wie bisher ein „ok“ zu melden, obwohl der Bot nie verbunden war. Falls Render den Service dadurch zu aggressiv neu startet (z. B. während Discord-Ausfällen), kann der Healthcheck mit `HEALTH_REQUIRE_DISCORD=false` wieder auf „immer ok“ gestellt werden; der Discord-Status bleibt in der Antwort trotzdem sichtbar.
 
 ## Lokal entwickeln
 
