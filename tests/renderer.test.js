@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 
 const root = new URL("../", import.meta.url);
 
@@ -24,4 +24,43 @@ test("public/draco_decoder.js definiert das globale DracoDecoderModule", () => {
 test("Dockerfile kopiert public/ in die Build-Stage, damit Vite draco_decoder.js in dist/ ablegt", () => {
   const dockerfile = readFileSync(new URL("Dockerfile", root), "utf8");
   assert.match(dockerfile, /COPY public \.\/public\//);
+});
+
+test("Renderer nutzt lokale Bibliotheks-Assets statt der cookie-pflichtigen Online-Versionen", () => {
+  const client = readFileSync(new URL("src/renderer-client.js", root), "utf8");
+  // Seit Roblox unauthentifizierte Asset-Delivery einschränkt (HTTP 401 für die
+  // privaten roavatar-Assets), müssen Rigs, Composit-Meshes & Standard-Texturen
+  // lokal vom Bot ausgeliefert werden.
+  assert.match(client, /FLAGS\.ONLINE_ASSETS = false/);
+  assert.match(client, /FLAGS\.ASSETS_PATH = "\/assets\/rbxasset\/"/);
+  assert.match(client, /FLAGS\.RIG_PATH = "\/assets\/"/);
+  // Avatar-Assets laufen versioniert über assetdelivery (cookie-frei).
+  assert.match(client, /rewriteAssetDeliveryUrl/);
+  assert.match(client, /recordAssetVersions\(outfit, assetVersionById\)/);
+});
+
+test("alle statischen roavatar-Assets sind im Repo vorhanden", () => {
+  const required = [
+    "public/assets/RigR15.rbxm",
+    "public/assets/RigR6.rbxm",
+    "public/assets/rbxasset/textures/face.png",
+    "public/assets/rbxasset/avatar/meshes/torso.mesh",
+    "public/assets/rbxasset/avatar/heads/head.mesh",
+    "public/assets/rbxasset/avatar/compositing/CompositTShirt.mesh",
+    "public/assets/rbxasset/avatar/compositing/CompositPantsTemplate.mesh",
+    "public/assets/rbxasset/textures/particles/SquareParticle.png",
+  ];
+  for (const file of required) {
+    assert.ok(existsSync(new URL(file, root)), `fehlendes lokales Asset: ${file}`);
+  }
+});
+
+test("Renderer löst die lokalen Rig-Pfade deterministisch auf", () => {
+  const client = readFileSync(new URL("src/renderer-client.js", root), "utf8");
+  // Der ContentMap der Bibliothek wird beim Import gebaut – der Bot fängt die
+  // Rig-Auflösung deshalb selbst ab, damit die lokalen Rigs immer absolut laden.
+  assert.match(client, /roavatar:\/\/RigR15\.rbxm"\) return "\/assets\/RigR15\.rbxm/);
+  assert.match(client, /roavatar:\/\/RigR6\.rbxm"\) return "\/assets\/RigR6\.rbxm/);
+  // Lokale Texturen (Standard-Gesicht, Partikel) dürfen nicht am Proxy-HTTPS-Check scheitern.
+  assert.match(client, /const remote = \/\^https:\\\/\\\//);
 });

@@ -7,6 +7,7 @@ import {
   RBXRenderer,
 } from "roavatar-renderer";
 
+import { createAssetVersionMap, recordAssetVersions, rewriteAssetDeliveryUrl } from "./asset-urls.js";
 import "./renderer.css";
 
 /**
@@ -72,6 +73,15 @@ const watchdog = setInterval(() => {
 
 const nativeFetch = window.fetch.bind(window);
 
+/**
+ * Asset-IDs → aktuelle Versionsnummern (currentVersionId aus der Avatar-Antwort).
+ * Roblox liefert unversionierte Asset-Delivery-Anfragen zunehmend nur noch mit
+ * Authentifizierung aus; der versionierte Endpunkt
+ * `assetdelivery.roblox.com/v2/assetId/{id}/version/{version}` funktioniert
+ * dagegen ohne Cookie. Deshalb werden alle bekannten Asset-Requests umgeschrieben.
+ */
+const assetVersionById = createAssetVersionMap();
+
 /** fetch mit hartem Zeitlimit — roavatar-renderer setzt selbst keins. */
 function fetchWithTimeout(input, init = {}) {
   const signals = [];
@@ -86,7 +96,7 @@ function fetchWithTimeout(input, init = {}) {
 const nativeFetchDirect = (input, init = {}) => {
   const raw = input instanceof Request ? input.url : String(input);
   if (/^https:\/\//i.test(raw)) {
-    return fetchWithTimeout(`/roblox-proxy?url=${encodeURIComponent(raw)}`, {
+    return fetchWithTimeout(`/roblox-proxy?url=${encodeURIComponent(rewriteAssetDeliveryUrl(raw, assetVersionById))}`, {
       method: init.method || "GET",
       signal: init.signal,
     });
@@ -95,7 +105,15 @@ const nativeFetchDirect = (input, init = {}) => {
 };
 FLAGS.FETCH_FUNC = nativeFetchDirect;
 
-FLAGS.ONLINE_ASSETS = true;
+FLAGS.ONLINE_ASSETS = false;
+// Statische Bibliotheks-Assets (Rigs, Composit-Meshes, Standard-Kopf/Fläche)
+// werden vom Bot selbst ausgeliefert: Roblox verlangt für die privaten
+// Online-Versionen dieser Assets seit April 2025 Authentifizierung
+// (HTTP 401 „Authentication required to access Asset.“), und der Bot hat –
+// bewusst – keinen Roblox-Cookie. Die eigentlichen Avatar-Assets des Users
+// kommen weiterhin live von Roblox.
+FLAGS.ASSETS_PATH = "/assets/rbxasset/";
+FLAGS.RIG_PATH = "/assets/";
 FLAGS.USE_WORKERS = false;
 FLAGS.ENABLE_HSR = false;
 FLAGS.USE_POST_PROCESSING = false;
@@ -107,17 +125,51 @@ FLAGS.GEAR_ENABLED = false;
 FLAGS.API_REQUEST_RETRY = true;
 
 /**
+ * Die Rig-URLs (`roavatar://RigR15.rbxm` / `RigR6`) löst die Bibliothek über
+ * ihren ContentMap auf, der beim Import mit den damaligen Flag-Werten gebaut
+ * wird. Damit die lokalen Rigs unabhängig von dieser Initialisierung immer
+ * absolut vom Bot geladen werden, fängt der Bot die Auflösung selbst ab.
+ * (parseAssetString wird zur Laufzeit über API.Misc aufgerufen, daher greift
+ * der Wrapper für alle internen Asset-Downloads.)
+ */
+const parseAssetStringOriginal = API.Misc.parseAssetString.bind(API.Misc);
+API.Misc.parseAssetString = (str) => {
+  if (str === "roavatar://RigR15.rbxm") return "/assets/RigR15.rbxm";
+  if (str === "roavatar://RigR6.rbxm") return "/assets/RigR6.rbxm";
+  return parseAssetStringOriginal(str);
+};
+
+/**
+ * Avatar-Konfiguration laden UND dabei die `currentVersionId` jedes Assets
+ * einsammeln, damit Asset-Downloads über den versionierten (cookie-freien)
+ * Endpunkt laufen können. Das Originalverhalten bleibt unverändert.
+ */
+const getAvatarDetailsOriginal = API.Avatar.GetAvatarDetails.bind(API.Avatar);
+API.Avatar.GetAvatarDetails = async (userId) => {
+  const outfit = await getAvatarDetailsOriginal(userId);
+  if (outfit instanceof Outfit) {
+    recordAssetVersions(outfit, assetVersionById);
+  }
+  return outfit;
+};
+
+/**
  * Das Original lädt Texturen direkt per <img> von rbxcdn.com — ohne Timeout und
  * am Proxy vorbei. Ein hängender CDN-Socket blockiert sonst den kompletten
- * Render bis zum globalen Zeitlimit. Deshalb: Abruf über den Proxy mit hartem
- * Zeitlimit; Fehler → undefined (gleiche Semantik wie image.onerror im Original).
+ * Render bis zum globalen Zeitlimit. Deshalb: Remote-Abruf über den Proxy mit
+ * hartem Zeitlimit; lokale Bibliotheks-Texturen (Standard-Gesicht, Partikel)
+ * direkt vom Bot. Fehler → undefined (gleiche Semantik wie image.onerror im Original).
  */
 API.Generic.LoadImage = (url) => (async () => {
   const fetchStr = await API.Misc.assetURLToCDNURL(url);
-  if (fetchStr instanceof Response || typeof fetchStr !== "string" || !/^https:\/\//i.test(fetchStr)) {
+  if (fetchStr instanceof Response || typeof fetchStr !== "string") {
     return undefined;
   }
-  const response = await fetchWithTimeout(`/roblox-proxy?url=${encodeURIComponent(fetchStr)}`);
+  const remote = /^https:\/\//i.test(fetchStr);
+  const target = remote
+    ? `/roblox-proxy?url=${encodeURIComponent(rewriteAssetDeliveryUrl(fetchStr, assetVersionById))}`
+    : fetchStr;
+  const response = await fetchWithTimeout(target);
   if (!response.ok) return undefined;
   const blob = await response.blob();
   if (!blob.size) return undefined;
@@ -134,6 +186,27 @@ API.Generic.LoadImage = (url) => (async () => {
     setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
   }
 })().catch(() => undefined);
+
+/**
+ * Übersetzt die interne Fehlerstufe von OutfitRenderer.onError/onRenderError
+ * in eine verständliche Beschreibung für die Discord-Antwort.
+ */
+function describeAssetFailure(stage) {
+  switch (stage) {
+    case "rig":
+      return "Das Basis-Rig (Skelett) konnte nicht geladen werden – die lokalen Renderer-Assets fehlen vermutlich oder sind beschädigt.";
+    case "humanoidDescription":
+      return "Die Avatar-Ausstattung (Körperteile, Kleidung, Accessoires, Animationen) konnte nicht vollständig angewendet werden – meist ein nicht ladbares oder moderiertes Asset auf Robloxs Seite.";
+    case "renderDesc":
+      return "Ein Mesh/Asset konnte nicht für das Rendering kompiliert werden – das Asset ist möglicherweise in einem neueren Format oder nicht ladbar.";
+    case "backgroundData":
+      return "Die Hintergrund-Daten konnten nicht geladen werden.";
+    case "avatarCyclorama":
+      return "Die Hintergrund-Bühne (Cyclorama) konnte nicht geladen werden.";
+    default:
+      return "Details stehen in den Server-Logs.";
+  }
+}
 
 async function render(userId) {
   report("setup", "3D-Engine wird vorbereitet …");
@@ -158,8 +231,22 @@ async function render(userId) {
   report("assets", "Originale Roblox-Assets und Meshes werden geladen …");
   const auth = new Authentication();
   const outfitRenderer = new OutfitRenderer(auth, outfit);
+  // Merkt sich die konkrete Fehlerstufe, damit die Fehlermeldung am Ende
+  // mehr sagt als „irgendein Asset hat nicht geklappt“.
+  let assetFailure = null;
+  outfitRenderer.onError.Connect((stage) => {
+    assetFailure = assetFailure || String(stage || "unknown");
+  });
+  outfitRenderer.onRenderError.Connect(() => {
+    assetFailure = assetFailure || "renderDesc";
+  });
   const succeeded = await outfitRenderer.prepareForThumbnail();
-  if (!succeeded) throw new Error("Mindestens ein Avatar-Asset konnte nicht verarbeitet werden.");
+  if (!succeeded) {
+    const detail = assetFailure
+      ? `Fehlerstufe: ${assetFailure} – ${describeAssetFailure(assetFailure)}`
+      : "Ursache unbekannt";
+    throw new Error(`Mindestens ein Avatar-Asset konnte nicht verarbeitet werden. ${detail}`);
+  }
 
   report("finalize", "Materialien, Pose, Licht und Kamera werden finalisiert …");
   // Genau ein finaler Frame statt Dauer-Loop; danach kurz auf die Darstellung warten.
