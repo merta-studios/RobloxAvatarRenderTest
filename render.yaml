@@ -21,6 +21,12 @@ services:
         value: "30"
       - key: LOGIN_TIMEOUT_SECONDS
         value: "60"
+      - key: LOGIN_ATTEMPTS
+        value: "3"
+      - key: LOGIN_BACKOFF_SECONDS
+        value: "5"
+      - key: DNS_RESULT_ORDER
+        value: ipv4first
       - key: HEALTH_REQUIRE_DISCORD
         value: "true"
       - key: DISCORD_DEBUG
