@@ -202,7 +202,7 @@ Der Fehler kommt mit Zusatzinfo, z. B. `… (letzte Phase: „assets“, zuletzt
 - **`browser`** – Chromium selbst ist nicht gestartet. Render-Logs prüfen (`[render]`), meist Speicher-Problem beim Start.
 - **`setup`** – WebGL2-Kontext konnte nicht erstellt werden. Sehr unwahrscheinlich mit SwiftShader; Render-Logs prüfen.
 - **`profile`** – `avatar.roblox.com` nicht erreichbar oder der User blockiert die Avatar-Auskunft.
-- **`assets`** – Ein Asset-Download hängt oder scheitert (Roblox-Rate-Limit, moderiert/gelöscht, zu groß). In den Logs steht dank Fortschritts-Watchdog nach 240 s das konkrete Asset: `Kein Fortschritt … (zuletzt geladen: getAssetBufferInternal-rbxassetid://123…)`.
+- **`assets`** – Ein Asset-Download hängt oder scheitert (Roblox-Rate-Limit, moderiert/gelöscht, zu groß). In den Logs steht dank Fortschritts-Watchdog nach 240 s das konkrete Asset: `Kein Fortschritt … (zuletzt geladen: getAssetBufferInternal-rbxassetid://123…)`. Die Fehlermeldung `Mindestens ein Avatar-Asset konnte nicht verarbeitet werden.` nennt seit dem Fix zusätzlich die Fehlerstufe (`rig` = lokale Renderer-Assets fehlen, `humanoidDescription` = ein getragenes Asset scheitert, `renderDesc` = ein Mesh kompiliert nicht).
 - **`finalize`** – Szene war fertig, aber das finale Bild konnte nicht gezeichnet werden (Speicher).
 
 Alle Phasen werden mit Laufzeit geloggt (`[render] userId=… Phase … (+42 s)`), sodass man in den Render-Logs genau sieht, wo die Zeit hingeht. Ergänzend kann es die Fehlermeldung `Chromium ist während des Renders abgestürzt` geben — das ist praktisch immer das Speicherlimit des freien Tarifs.
@@ -223,22 +223,32 @@ Alle Phasen werden mit Laufzeit geloggt (`[render] userId=… Phase … (+42 s)`
 - Asset-Größen- und Netzwerk-Zeitlimits begrenzen Speicherverbrauch.
 - Discord prüft die Administratorberechtigung sowohl bei der Command-Definition als auch zur Laufzeit.
 
+## Woher kommen die Assets?
+
+Roblox verlangt seit April 2025 für die alten, unversionierten Asset-Delivery-Endpunkte
+(`assetdelivery.roblox.com/v1|v2/asset?id=…`) zunehmend Authentifizierung
+(HTTP 401, „Authentication required to access Asset.“). Der Bot hat bewusst keinen
+Roblox-Cookie – deshalb lädt er Assets auf zwei cookie-freien Wegen:
+
+1. **Statische Renderer-Assets lokal:** Das Basis-Rig (R15/R6), die Composit-Meshes,
+   Standard-Kopfmeshes und -Texturen kommen aus `public/assets/`. Diese Dateien
+   stammen aus dem [RoAvatar-Projekt](https://github.com/steinann/RoAvatar)
+   (GPL-3.0, gleicher Autor wie `roavatar-renderer`). Der Renderer läuft mit
+   `FLAGS.ONLINE_ASSETS = false` und holt sie über `/assets/…` vom Bot selbst –
+   genau diese Assets antworteten online nur noch mit 401 und verursachten
+   „Render fehlgeschlagen – Mindestens ein Avatar-Asset konnte nicht verarbeitet werden.“
+2. **Avatar-Assets des Users versioniert:** Kleidung, Körperteile, Accessoires,
+   Animationen und Texturen werden weiterhin live von Roblox geladen. Die
+   Avatar-API liefert zu jedem getragenen Asset die `currentVersionId` mit; der
+   Renderer schreibt Asset-Anfragen auf den versionierten Endpunkt
+   `assetdelivery.roblox.com/v2/assetId/{id}/version/{version}` um
+   (`src/asset-urls.js`), der ohne Cookie funktioniert. Assets ohne bekannte
+   Version (z. B. Texturen in älteren Katalog-Assets) laufen weiter über den
+   Legacy-Endpunkt, solange Roblox ihn bedient.
+
 ## Lizenz
 
 GPL-3.0-only, weil `roavatar-renderer` unter GPL-3.0-only eingebunden ist. Siehe `LICENSE`.
-imits können einen Render verhindern.
-- Roblox kann seine Legacy-Web-APIs ohne Vorankündigung ändern.
-- Einige besonders neue Dynamic Heads, Partikel oder Layered-Clothing-Kombinationen können vom Open-Source-Renderer noch nicht perfekt dargestellt werden.
-- Der Lock gilt für genau eine laufende Service-Instanz.
-- Render Free Services können bei Inaktivität schlafen. Ein dauerhaft verbundener Discord-Bot benötigt je nach aktuellem Render-Angebot eventuell einen kostenpflichtigen Always-on-Service.
-
-## Sicherheit
-
-- Keine Roblox-Cookies oder Benutzer-Credentials.
-- `/roblox-proxy` akzeptiert nur HTTPS-Ziele auf fest erlaubten Roblox-/RBXCDN-Hosts.
-- Asset-Größen- und Netzwerk-Zeitlimits begrenzen Speicherverbrauch.
-- Discord prüft die Administratorberechtigung sowohl bei der Command-Definition als auch zur Laufzeit.
-
-## Lizenz
-
-GPL-3.0-only, weil `roavatar-renderer` unter GPL-3.0-only eingebunden ist. Siehe `LICENSE`.
+Die statischen Renderer-Assets in `public/assets/` stammen aus
+[steinann/RoAvatar](https://github.com/steinann/RoAvatar) (GPL-3.0) – siehe
+`public/assets/README.md`.
