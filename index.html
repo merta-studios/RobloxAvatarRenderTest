@@ -1,5 +1,13 @@
 <!doctype html>
 <html lang="de">
-  <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Avatar Renderer</title></head>
-  <body><main id="app"><p id="status">Renderer bereit</p></main><script type="module" src="/src/renderer-client.js"></script></body>
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Avatar Renderer</title>
+    <!-- Muss VOR dem gebündelten Renderer-Modul geladen werden: roavatar-renderer
+         erwartet das globale DracoDecoderModule aus diesem klassischen Script. -->
+    <script src="/draco_decoder.js"></script>
+    <script type="module" src="/src/renderer-client.js"></script>
+  </head>
+  <body><main id="app"><p id="status">Renderer bereit</p></main></body>
 </html>

@@ -4,6 +4,9 @@ COPY package*.json ./
 RUN npm ci --no-audit --no-fund
 COPY index.html vite.config.js ./
 COPY src/renderer-client.js src/renderer.css ./src/
+# draco_decoder.js (klassisches Script, setzt das globale DracoDecoderModule)
+# muss vor dem gebündelten Renderer geladen werden; Vite kopiert public/ 1:1 nach dist/.
+COPY public ./public/
 RUN npm run build && npm prune --omit=dev
 
 FROM node:22-bookworm-slim

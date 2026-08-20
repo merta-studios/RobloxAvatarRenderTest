@@ -287,6 +287,7 @@ async function renderAvatar(userId, onProgress) {
   let lastPhase = "";
   let lastMessage = "";
   let pageCrashed = null;
+  let pageError = null;
   try {
     onProgress("browser", "Speichersparender 3D-Renderer wird gestartet …");
     browser = await puppeteer.launch({
@@ -318,7 +319,10 @@ async function renderAvatar(userId, onProgress) {
     page.on("console", (message) => {
       if (message.type() === "error") console.error("Renderer:", message.text());
     });
-    page.on("pageerror", (error) => console.error("Renderer page error:", error));
+    page.on("pageerror", (error) => {
+      pageError = redactSecrets(error?.message || String(error));
+      console.error("Renderer page error:", pageError);
+    });
     page.on("error", (error) => {
       pageCrashed = error;
       logError(`[render] userId=${userId}: Chromium-Tab abgestürzt: ${error?.message || error}`);
@@ -354,6 +358,9 @@ async function renderAvatar(userId, onProgress) {
           throw new Error("Chromium ist während des Renders abgestürzt – meist das Speicherlimit (freier Tarif: ~500 MB). Eventuell hilft ein größerer Tarif.");
         }
         if (error?.name === "TimeoutError") {
+          if (!lastPhase && pageError) {
+            throw new Error(`Der Renderer konnte nicht initialisiert werden: ${pageError}`);
+          }
           throw new Error(`Der Render hat das Zeitlimit von ${Math.round(config.renderTimeoutMs / 1000)} s überschritten (letzte Phase: „${lastPhase || "unbekannt"}“, zuletzt: „${lastMessage || "–"}“).`);
         }
         throw error;
