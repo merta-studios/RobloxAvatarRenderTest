@@ -282,12 +282,18 @@ app.get("/render", (_request, response) => response.sendFile("index.html", { roo
 
 async function renderAvatar(userId, onProgress) {
   let browser;
+  const startedAt = Date.now();
+  const elapsed = () => `+${Math.round((Date.now() - startedAt) / 1000)} s`;
+  let lastPhase = "";
+  let lastMessage = "";
+  let pageCrashed = null;
   try {
     onProgress("browser", "Speichersparender 3D-Renderer wird gestartet …");
     browser = await puppeteer.launch({
       executablePath: config.chromiumPath,
       headless: true,
       protocolTimeout: config.renderTimeoutMs,
+      dumpio: config.debug,
       args: [
         "--no-sandbox",
         "--disable-setuid-sandbox",
@@ -313,34 +319,53 @@ async function renderAvatar(userId, onProgress) {
       if (message.type() === "error") console.error("Renderer:", message.text());
     });
     page.on("pageerror", (error) => console.error("Renderer page error:", error));
+    page.on("error", (error) => {
+      pageCrashed = error;
+      logError(`[render] userId=${userId}: Chromium-Tab abgestürzt: ${error?.message || error}`);
+    });
 
     await page.goto(`http://127.0.0.1:${config.port}/render?userId=${userId}`, {
       waitUntil: "domcontentloaded",
       timeout: 30_000,
     });
+    log(`[render] userId=${userId}: Chromium gestartet und Renderer-Seite geladen (${elapsed()}).`);
 
-    let lastPhase = "";
     const progressTimer = setInterval(async () => {
       try {
         const state = await page.evaluate(() => window.__renderState);
-        if (state?.phase && state.phase !== lastPhase) {
+        if (!state) return;
+        if (state.message) lastMessage = state.message;
+        if (state.phase && state.phase !== lastPhase) {
           lastPhase = state.phase;
+          log(`[render] userId=${userId}: Phase ${state.phase} – ${state.message || "–"} (${elapsed()})`);
           onProgress(state.phase, state.message);
         }
       } catch { /* Browser is closing. */ }
     }, 1500);
 
     try {
-      await page.waitForFunction(() => window.__renderState?.done === true, {
-        polling: 500,
-        timeout: config.renderTimeoutMs,
-      });
+      try {
+        await page.waitForFunction(() => window.__renderState?.done === true, {
+          polling: 500,
+          timeout: config.renderTimeoutMs,
+        });
+      } catch (error) {
+        if (pageCrashed) {
+          throw new Error("Chromium ist während des Renders abgestürzt – meist das Speicherlimit (freier Tarif: ~500 MB). Eventuell hilft ein größerer Tarif.");
+        }
+        if (error?.name === "TimeoutError") {
+          throw new Error(`Der Render hat das Zeitlimit von ${Math.round(config.renderTimeoutMs / 1000)} s überschritten (letzte Phase: „${lastPhase || "unbekannt"}“, zuletzt: „${lastMessage || "–"}“).`);
+        }
+        throw error;
+      }
       const state = await page.evaluate(() => window.__renderState);
-      if (state.error) throw new Error(state.error);
+      if (state?.error) throw new Error(state.error);
       onProgress("capture", "Finales PNG wird erzeugt …");
       const canvas = await page.$("canvas");
       if (!canvas) throw new Error("Renderer hat keine Bildfläche erzeugt.");
-      return await canvas.screenshot({ type: "png", optimizeForSpeed: true });
+      const png = await canvas.screenshot({ type: "png", optimizeForSpeed: true });
+      log(`[render] userId=${userId}: PNG erzeugt, ${(png.length / 1024).toFixed(0)} KB (${elapsed()}).`);
+      return png;
     } finally {
       clearInterval(progressTimer);
     }
@@ -427,7 +452,7 @@ async function handleRender(interaction) {
     reportError("[render] Render fehlgeschlagen", error);
     const friendly = error instanceof RobloxError ? error.message
       : error?.name === "TimeoutError" ? "Der Render hat das Zeitlimit überschritten."
-      : `Render fehlgeschlagen: ${error?.message || "Unbekannter Fehler"}`;
+      : (error?.message || "Unbekannter Fehler");
     await editChain;
     if (interaction.deferred || interaction.replied) {
       await interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xed4245).setTitle("❌ Render fehlgeschlagen").setDescription(friendly)], files: [] }).catch(console.error);
