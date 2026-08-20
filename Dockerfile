@@ -17,7 +17,7 @@ WORKDIR /app
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
 COPY package.json ./
-COPY src/server.js src/config.js src/commands.js src/roblox.js ./src/
+COPY src/server.js src/config.js src/commands.js src/roblox.js src/discord-net.js ./src/
 USER node
 EXPOSE 10000
 CMD ["node", "src/server.js"]

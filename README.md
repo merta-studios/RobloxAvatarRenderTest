@@ -61,7 +61,7 @@ Der Bot braucht **keinen Roblox-Cookie**. Niemals `.ROBLOSECURITY` als Environme
 | `DISCORD_GUILD_ID` | ID des Testservers (empfohlen) |
 
 5. Deploy starten.
-6. In den Logs müssen nacheinander `[http] HTTP: Port …`, die `[diagnose]`-Zeilen (DNS, TCP, REST-Probe), `[preflight] Token akzeptiert …`, `[login] Versuch 1: Verbinde mit dem Discord-Gateway …`, `[gateway] Discord: eingeloggt als …` und `[commands] … Command(s) registriert …` erscheinen. **Die Netzwerk-Diagnose und der Gateway-Login passieren bewusst vor der Command-Registrierung** – erst wenn der Bot online ist, wird per REST registriert.
+6. In den Logs müssen nacheinander `[http] HTTP: Port …`, die `[diagnose]`-Zeilen (DNS, TCP), `[preflight] Token akzeptiert …` **oder** `[preflight] Discord-REST nicht nutzbar … Gateway-Login läuft trotzdem`, `[login] Versuch 1: Verbinde mit dem Discord-Gateway …`, `[gateway] Discord: eingeloggt als …` erscheinen. Command-Registrierung folgt danach; bei 1015 wird sie im Hintergrund wiederholt. **Login vor REST-Registrierung** – der Bot darf nicht offline bleiben, nur weil Cloudflare `discord.com` sperrt.
 7. Auf dem Testserver `/render_avatar username:Builderman` ausprobieren.
 
 Mit `DISCORD_GUILD_ID` erscheint der Command normalerweise sofort. Ohne diese Variable wird er global registriert; globale Discord-Commands können verzögert sichtbar werden.
@@ -121,9 +121,9 @@ Siehe `.env.example`.
 Beim Start passiert Folgendes – jede Phase loggt mit eigenem Tag und Zeitstempel:
 
 1. **`[http]`** Der HTTP-Server öffnet den Port, damit der Render-Healthcheck erreichbar ist.
-2. **`[diagnose]`** Vor dem Login wird die Netzwerkstrecke zu Discord geprüft: DNS-Auflösung von `gateway.discord.gg`, rohe TCP-Probe auf Port 443 und REST-Probe auf `https://discord.com/api/v10/gateway` – jeweils mit eigenem Zeitlimit und Log. Damit ist sofort sichtbar, auf welcher Ebene eine Verbindung hängt (DNS → TCP → TLS/REST → WebSocket).
-3. **`[preflight]`** Vor jedem Login-Versuch wird `GET /gateway/bot` **mit dem echten Bot-Token** und regelkonformem `DiscordBot`-User-Agent abgefragt – mit hartem Zeitlimit. Damit steht sofort im Log, ob der Token gültig ist (401), ob Cloudflare blockt bzw. rate-limitet (HTML-Antwort, `cloudflare-error=…`, `cf-ray=…`) oder ob das Session-Start-Limit erschöpft ist. Ein ungültiger Token führt zum sauberen Abbruch statt zu endlosen Neustarts.
-4. **`[login]`** Der Bot verbindet sich mit dem **Discord-Gateway**. Jeder Versuch nutzt einen frischen Client, hat das Timeout `LOGIN_TIMEOUT_SECONDS` und gilt erst als erfolgreich, wenn das `ClientReady`-Event kommt. Zwischen den Versuchen wächst die Wartezeit exponentiell (`LOGIN_BACKOFF_SECONDS` bis `LOGIN_BACKOFF_MAX_SECONDS`). Mit `LOGIN_ATTEMPTS=0` (Standard) versucht der Prozess es dauerhaft weiter, statt sich zu beenden – der Bot kommt so von allein zurück, sobald Discord wieder erreichbar ist.
+2. **`[diagnose]`** Vor dem Login wird die Netzwerkstrecke zu Discord geprüft: DNS-Auflösung von `gateway.discord.gg` und rohe TCP-Probe auf Port 443. **Kein** unauthentifizierter REST-Call auf `/gateway` – genau der hat auf Render-Free-IPs Cloudflare 1015 ausgelöst und die Sperre verlängert.
+3. **`[preflight]`** `GET /gateway/bot` mit Bot-Token, nacheinander über `discord.com`, `canary.discord.com`, `ptb.discord.com` und `discordapp.com`. 401 bricht ab. **HTTP 429 / Cloudflare 1015 überspringt den Login nicht** – der Bot geht trotzdem auf das Gateway. Betroffene Hosts kommen in den echten `Retry-After`-Cooldown (Header, nicht das JSON-Feld 30 s).
+4. **`[login]`** Gateway-WebSocket. Wenn REST 1015 liefert, nutzt discord.js intern den Fallback `wss://gateway.discord.gg` statt 6 Stunden auf `/gateway/bot` zu warten. `ClientReady` ist nötig, damit der Bot als online gilt. Backoff nur, wenn auch der WebSocket scheitert.
 5. **`[commands]`** Erst nach erfolgreichem Login wird der Slash-Command per REST registriert. Jede einzelne REST-Anfrage hat ein Timeout (`REST_TIMEOUT_SECONDS`), die gesamte Registrierung zusätzlich eine harte Deadline (3 Versuche à Timeout plus Puffer). Scheitert die Registrierung, **bleibt der Bot online** und der Fehler ist in Logs und `/health` sichtbar.
 
 Gateway-Ereignisse (Reconnect, Disconnect, Shard-Fehler, Warnungen) werden unter `[gateway]` bzw. `[discord]` geloggt. Während der Login-Phase laufen die rohen discord.js-Debug-Logs automatisch mit (`[debug]`); dauerhaft lassen sie sich mit `DISCORD_DEBUG=true` aktivieren, Fehler werden dann zusätzlich mit allen Details ausgegeben. Bot-Tokens werden in Logs und Health-Antworten grundsätzlich geschwärzt (`[REDACTED]`).
@@ -194,6 +194,22 @@ Der produktive Server liest `.env` nicht automatisch. Lokal die Werte in der She
 
 - Der Command erwartet den eindeutigen Roblox-**Username**, nicht den Display Name.
 - Private/moderierte/gelöschte Assets oder temporäre Roblox-Rate-Limits können einen Render verhindern.
+- Roblox kann seine Legacy-Web-APIs ohne Vorankündigung ändern.
+- Einige besonders neue Dynamic Heads, Partikel oder Layered-Clothing-Kombinationen können vom Open-Source-Renderer noch nicht perfekt dargestellt werden.
+- Der Lock gilt für genau eine laufende Service-Instanz.
+- Render Free Services können bei Inaktivität schlafen. Ein dauerhaft verbundener Discord-Bot benötigt je nach aktuellem Render-Angebot eventuell einen kostenpflichtigen Always-on-Service.
+
+## Sicherheit
+
+- Keine Roblox-Cookies oder Benutzer-Credentials.
+- `/roblox-proxy` akzeptiert nur HTTPS-Ziele auf fest erlaubten Roblox-/RBXCDN-Hosts.
+- Asset-Größen- und Netzwerk-Zeitlimits begrenzen Speicherverbrauch.
+- Discord prüft die Administratorberechtigung sowohl bei der Command-Definition als auch zur Laufzeit.
+
+## Lizenz
+
+GPL-3.0-only, weil `roavatar-renderer` unter GPL-3.0-only eingebunden ist. Siehe `LICENSE`.
+imits können einen Render verhindern.
 - Roblox kann seine Legacy-Web-APIs ohne Vorankündigung ändern.
 - Einige besonders neue Dynamic Heads, Partikel oder Layered-Clothing-Kombinationen können vom Open-Source-Renderer noch nicht perfekt dargestellt werden.
 - Der Lock gilt für genau eine laufende Service-Instanz.
