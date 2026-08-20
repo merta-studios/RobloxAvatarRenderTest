@@ -16,6 +16,8 @@ export const config = {
   maxProxyBytes: integer("MAX_ASSET_MB", 30, 5, 60) * 1024 * 1024,
   restTimeoutMs: integer("REST_TIMEOUT_SECONDS", 30, 5, 300) * 1000,
   loginTimeoutMs: integer("LOGIN_TIMEOUT_SECONDS", 60, 10, 600) * 1000,
+  loginAttempts: integer("LOGIN_ATTEMPTS", 3, 1, 10),
+  loginBackoffMs: integer("LOGIN_BACKOFF_SECONDS", 5, 0, 60) * 1000,
   healthRequireDiscord: (process.env.HEALTH_REQUIRE_DISCORD ?? "true") !== "false",
   debug: process.env.DISCORD_DEBUG === "true",
 };

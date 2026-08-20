@@ -2,6 +2,9 @@ import express from "express";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import util from "node:util";
+import { setDefaultResultOrder } from "node:dns";
+import { lookup as dnsLookup } from "node:dns/promises";
+import net from "node:net";
 import puppeteer from "puppeteer-core";
 import {
   AttachmentBuilder,
@@ -17,6 +20,10 @@ import {
 import { commands } from "./commands.js";
 import { config, validateBotConfig } from "./config.js";
 import { isAllowedRobloxAssetUrl, resolveRobloxUser, RobloxError } from "./roblox.js";
+
+const dnsOrder = process.env.DNS_RESULT_ORDER === "verbatim" ? "verbatim" : "ipv4first";
+setDefaultResultOrder(dnsOrder);
+net.setDefaultAutoSelectFamily(false);
 
 validateBotConfig();
 let busy = false;
@@ -62,18 +69,76 @@ function withTimeout(promise, timeoutMs, label) {
   return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Rohe TCP-Verbindungsprobe (Happy Eyeballs aus): nur IPv4, mit hartem Zeitlimit. */
+function tcpProbe(host, port, timeoutMs) {
+  return new Promise((resolve) => {
+    const startedAt = Date.now();
+    const socket = net.connect({ host, port });
+    socket.setTimeout(timeoutMs);
+    socket.once("connect", () => {
+      socket.destroy();
+      resolve({ ok: true, ms: Date.now() - startedAt, error: null });
+    });
+    socket.once("error", (error) => {
+      socket.destroy();
+      resolve({ ok: false, ms: Date.now() - startedAt, error });
+    });
+    socket.once("timeout", () => {
+      socket.destroy();
+      resolve({ ok: false, ms: Date.now() - startedAt, error: new Error(`Timeout nach ${timeoutMs} ms überschritten.`) });
+    });
+  });
+}
+
+/**
+ * Netzwerk-Diagnose vor dem Login: zeigt in den Logs, auf welcher Ebene eine
+ * Verbindung zu Discord hängt (DNS → TCP → TLS/REST → WebSocket).
+ */
+async function diagnoseNetwork() {
+  try {
+    const addresses = await dnsLookup("gateway.discord.gg", { all: true });
+    log(`[diagnose] DNS gateway.discord.gg: ${addresses.map((entry) => `${entry.address} (${entry.family === 4 ? "IPv4" : "IPv6"})`).join(", ")}`);
+  } catch (error) {
+    reportError("[diagnose] DNS-Auflösung von gateway.discord.gg fehlgeschlagen", error);
+  }
+
+  try {
+    const probe = await tcpProbe("gateway.discord.gg", 443, 10_000);
+    if (probe.ok) log(`[diagnose] TCP gateway.discord.gg:443 verbunden in ${probe.ms} ms.`);
+    else logError(`[diagnose] TCP gateway.discord.gg:443 FEHLER: ${describeError(probe.error)}`);
+  } catch (error) {
+    reportError("[diagnose] TCP-Probe auf gateway.discord.gg:443 fehlgeschlagen", error);
+  }
+
+  try {
+    const response = await fetch("https://discord.com/api/v10/gateway", {
+      signal: AbortSignal.timeout(10_000),
+      headers: { "user-agent": "AvatarRenderTest/1.0" },
+    });
+    const body = await response.json();
+    log(`[diagnose] REST https://discord.com/api/v10/gateway: HTTP ${response.status}, empfohlenes Gateway: ${redactSecrets(body.url)}`);
+  } catch (error) {
+    reportError("[diagnose] REST-Probe auf https://discord.com/api/v10/gateway fehlgeschlagen", error);
+  }
+}
+
 const botState = {
   status: "offline", // offline | connecting | ready | reconnecting
   readyAt: null,
   userTag: null,
   lastGatewayError: null,
+  lastLoginError: null,
   commandRegistration: { state: "pending", startedAt: null, target: null, count: 0, durationMs: null, error: null },
 };
 
 const app = express();
 app.disable("x-powered-by");
 app.get("/health", (_request, response) => {
-  const discordReady = client.isReady();
+  const discordReady = Boolean(client?.isReady());
   const healthy = discordReady || !config.healthRequireDiscord;
   response.status(healthy ? 200 : 503).json({
     ok: healthy,
@@ -85,9 +150,10 @@ app.get("/health", (_request, response) => {
       status: botState.status,
       user: botState.userTag,
       readyAt: botState.readyAt,
-      ping: client.ws?.ping ?? null,
-      gateway: client.ws?.gateway ?? null,
+      ping: client?.ws?.ping ?? null,
+      gateway: client?.ws?.gateway ?? null,
       lastError: botState.lastGatewayError,
+      lastLoginError: botState.lastLoginError,
     },
     commands: botState.commandRegistration,
   });
@@ -308,65 +374,110 @@ async function handleRender(interaction) {
   }
 }
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
+let client;
+let verboseLogin = false;
 
-client.on(Events.ClientReady, (readyClient) => {
-  botState.status = "ready";
-  botState.readyAt = new Date().toISOString();
-  botState.userTag = readyClient.user.tag;
-  log(`[gateway] Discord: eingeloggt als ${readyClient.user.tag} (ID ${readyClient.user.id}).`);
-  log(`[gateway] Endpunkt ${client.ws.gateway}, Shards ${client.ws.shards.size}, Ping ${client.ws.ping} ms, Guilds im Cache: ${client.guilds.cache.size}.`);
-});
-client.on(Events.ShardReconnecting, (shardId) => {
-  botState.status = "reconnecting";
-  log(`[gateway] Shard ${shardId}: Verbindung wird wiederhergestellt …`);
-});
-client.on(Events.ShardResume, (shardId, replayed) => {
-  botState.status = "ready";
-  log(`[gateway] Shard ${shardId}: Sitzung fortgesetzt (${replayed} Events erneut zugestellt).`);
-});
-client.on(Events.ShardDisconnect, (event, shardId) => {
-  botState.status = "reconnecting";
-  log(`[gateway] Shard ${shardId}: Verbindung getrennt (Code ${event.code}${event.reason ? `, Grund: ${event.reason}` : ""}).`);
-});
-client.on(Events.ShardError, (error, shardId) => {
-  botState.lastGatewayError = redactSecrets(error?.message || String(error));
-  reportError(`[gateway] Shard ${shardId}`, error);
-});
-client.on(Events.Warn, (info) => log(`[discord] Warnung: ${redactSecrets(info)}`));
-client.on(Events.Error, (error) => {
-  botState.lastGatewayError = redactSecrets(error?.message || String(error));
-  reportError("[discord]", error);
-});
-client.on(Events.Invalidated, () => {
-  botState.status = "offline";
-  logError("[gateway] Sitzung invalidiert (Token zurückgezogen?). Neustart erforderlich.");
-});
-if (config.debug) client.on(Events.Debug, (message) => log(`[debug] ${redactSecrets(message)}`));
+/** Frischer Client je Login-Versuch; Logs alter Instanzen werden über isCurrent() unterdrückt. */
+function createClient() {
+  const newClient = new Client({ intents: [GatewayIntentBits.Guilds] });
+  const isCurrent = () => newClient === client;
 
-client.on("interactionCreate", (interaction) => {
-  if (interaction.isChatInputCommand() && interaction.commandName === "render_avatar") void handleRender(interaction);
-});
+  newClient.on(Events.ClientReady, (readyClient) => {
+    if (!isCurrent()) return;
+    verboseLogin = false;
+    botState.status = "ready";
+    botState.readyAt = new Date().toISOString();
+    botState.userTag = readyClient.user.tag;
+    log(`[gateway] Discord: eingeloggt als ${readyClient.user.tag} (ID ${readyClient.user.id}).`);
+    log(`[gateway] Endpunkt ${newClient.ws.gateway}, Shards ${newClient.ws.shards.size}, Ping ${newClient.ws.ping} ms, Guilds im Cache: ${newClient.guilds.cache.size}.`);
+  });
+  newClient.on(Events.ShardReconnecting, (shardId) => {
+    if (!isCurrent()) return;
+    botState.status = "reconnecting";
+    log(`[gateway] Shard ${shardId}: Verbindung wird wiederhergestellt …`);
+  });
+  newClient.on(Events.ShardResume, (shardId, replayed) => {
+    if (!isCurrent()) return;
+    botState.status = "ready";
+    log(`[gateway] Shard ${shardId}: Sitzung fortgesetzt (${replayed} Events erneut zugestellt).`);
+  });
+  newClient.on(Events.ShardDisconnect, (event, shardId) => {
+    if (!isCurrent()) return;
+    botState.status = "reconnecting";
+    log(`[gateway] Shard ${shardId}: Verbindung getrennt (Code ${event.code}${event.reason ? `, Grund: ${event.reason}` : ""}).`);
+  });
+  newClient.on(Events.ShardError, (error, shardId) => {
+    if (!isCurrent()) return;
+    botState.lastGatewayError = redactSecrets(error?.message || String(error));
+    reportError(`[gateway] Shard ${shardId}`, error);
+  });
+  newClient.on(Events.Warn, (info) => {
+    if (!isCurrent()) return;
+    log(`[discord] Warnung: ${redactSecrets(info)}`);
+  });
+  newClient.on(Events.Error, (error) => {
+    if (!isCurrent()) return;
+    botState.lastGatewayError = redactSecrets(error?.message || String(error));
+    reportError("[discord]", error);
+  });
+  newClient.on(Events.Invalidated, () => {
+    if (!isCurrent()) return;
+    botState.status = "offline";
+    logError("[gateway] Sitzung invalidiert (Token zurückgezogen?). Neustart erforderlich.");
+  });
+  // Während der Login-Phase laufen die Debug-Logs automatisch mit (verboseLogin),
+  // danach nur noch mit DISCORD_DEBUG=true. Tokens werden grundsätzlich geschwärzt.
+  newClient.on(Events.Debug, (message) => {
+    if (isCurrent() && (verboseLogin || config.debug)) log(`[debug] ${redactSecrets(message)}`);
+  });
+
+  newClient.on("interactionCreate", (interaction) => {
+    if (!isCurrent()) return;
+    if (interaction.isChatInputCommand() && interaction.commandName === "render_avatar") void handleRender(interaction);
+  });
+
+  return newClient;
+}
 
 async function startBot() {
   const startedAt = Date.now();
   log(`[startup] Start (Node ${process.version}, PID ${process.pid}).`);
-  log(`[startup] App-ID ${config.applicationId}, Commands ${config.guildId ? `nur für Guild ${config.guildId}` : "global"}, REST-Timeout ${config.restTimeoutMs / 1000} s, Login-Timeout ${config.loginTimeoutMs / 1000} s, Healthcheck erfordert Discord: ${config.healthRequireDiscord ? "ja" : "nein"}, Debug-Logs ${config.debug ? "an" : "aus"}.`);
+  log(`[startup] App-ID ${config.applicationId}, Commands ${config.guildId ? `nur für Guild ${config.guildId}` : "global"}, REST-Timeout ${config.restTimeoutMs / 1000} s, Login-Timeout ${config.loginTimeoutMs / 1000} s, Login-Versuche ${config.loginAttempts} (Abstand ${config.loginBackoffMs / 1000} s), DNS-Reihenfolge ${dnsOrder}, Healthcheck erfordert Discord: ${config.healthRequireDiscord ? "ja" : "nein"}, Debug-Logs ${config.debug ? "an" : "aus"}.`);
 
-  // 1) Gateway-Login zuerst: Erst wenn der Bot online ist, wird die Command-Registrierung versucht.
-  botState.status = "connecting";
-  log(`[login] Verbinde mit dem Discord-Gateway (Timeout: ${config.loginTimeoutMs / 1000} s) …`);
-  try {
-    await withTimeout(client.login(config.token), config.loginTimeoutMs, "Discord-Login");
-  } catch (error) {
-    reportError("[login] Login fehlgeschlagen", error);
-    logError(`[login] Abbruch nach ${((Date.now() - startedAt) / 1000).toFixed(1)} s. Prozess wird beendet, damit die Plattform einen Neustart versuchen kann.`);
+  // 1) Netzwerk-Diagnose vor dem Login: zeigt in den Logs, auf welcher Ebene es hängt (DNS → TCP → TLS/REST → WebSocket).
+  await diagnoseNetwork();
+
+  // 2) Gateway-Login mit Retries: Erst wenn der Bot online ist, wird die Command-Registrierung versucht.
+  verboseLogin = true;
+  let loginError = null;
+  for (let attempt = 1; attempt <= config.loginAttempts; attempt += 1) {
+    client = createClient();
+    botState.status = `connecting (Versuch ${attempt}/${config.loginAttempts})`;
+    log(`[login] Versuch ${attempt}/${config.loginAttempts}: Verbinde mit dem Discord-Gateway (Timeout: ${config.loginTimeoutMs / 1000} s) …`);
+    try {
+      await withTimeout(client.login(config.token), config.loginTimeoutMs, "Discord-Login");
+      loginError = null;
+      log(`[login] Login abgeschlossen nach ${((Date.now() - startedAt) / 1000).toFixed(1)} s (Versuch ${attempt}).`);
+      break;
+    } catch (error) {
+      loginError = error;
+      botState.lastLoginError = redactSecrets(error?.message || String(error));
+      reportError(`[login] Versuch ${attempt}/${config.loginAttempts} fehlgeschlagen`, error);
+      client.destroy();
+      if (attempt < config.loginAttempts) {
+        log(`[login] Nächster Versuch in ${config.loginBackoffMs / 1000} s …`);
+        await sleep(config.loginBackoffMs);
+      }
+    }
+  }
+  if (loginError) {
+    verboseLogin = false;
+    logError(`[login] Alle ${config.loginAttempts} Versuche fehlgeschlagen nach ${((Date.now() - startedAt) / 1000).toFixed(1)} s. Prozess wird beendet, damit die Plattform einen Neustart versuchen kann.`);
     shutdownNow(1);
     return;
   }
-  log(`[login] Login abgeschlossen nach ${((Date.now() - startedAt) / 1000).toFixed(1)} s.`);
 
-  // 2) Danach Command-Registrierung per REST, mit Zeitlimits auf beiden Ebenen.
+  // 3) Danach Command-Registrierung per REST, mit Zeitlimits auf beiden Ebenen.
   const guildScoped = Boolean(config.guildId);
   const target = guildScoped ? `Guild ${config.guildId}` : "global";
   botState.commandRegistration = { state: "registering", startedAt: new Date().toISOString(), target, count: 0, durationMs: null, error: null };
@@ -398,7 +509,7 @@ const server = app.listen(config.port, "0.0.0.0", () => {
 });
 
 function shutdownNow(exitCode) {
-  client.destroy();
+  client?.destroy();
   server.close(() => process.exit(exitCode));
   setTimeout(() => process.exit(exitCode), 10_000).unref();
 }
