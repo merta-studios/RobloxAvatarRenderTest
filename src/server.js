@@ -21,7 +21,7 @@ import { getBuildInfo } from "./build-info.js";
 import { commands } from "./commands.js";
 import { config, validateBotConfig } from "./config.js";
 import { createDiscordNet } from "./discord-net.js";
-import { isAllowedRobloxAssetUrl, resolveRobloxUser, RobloxError } from "./roblox.js";
+import { isAllowedRobloxAssetUrl, openCloudAssetDeliveryUrl, resolveRobloxUser, RobloxError } from "./roblox.js";
 
 const dnsOrder = process.env.DNS_RESULT_ORDER === "verbatim" ? "verbatim" : "ipv4first";
 setDefaultResultOrder(dnsOrder);
@@ -243,6 +243,64 @@ async function fetchAllowedRobloxUrl(initialUrl, signal, extraHeaders = {}) {
   throw new Error("Zu viele Redirects");
 }
 
+/**
+ * Lädt ein Roblox-Asset für den Proxy. Mit konfiguriertem OpenCloud-API-Key
+ * läuft die Anfrage für assetdelivery.roblox.com zuerst über die offizielle
+ * OpenCloud Asset-Delivery-API (funktioniert auch für UGC, das seit April 2025
+ * unauthentifiziert HTTP 401 liefert); schlägt sie fehl, folgt der normale
+ * assetdelivery-Pfad mit Retry.
+ *
+ * @returns {Promise<{upstream: Response, via: string}>}
+ */
+async function fetchUpstreamWithFallbacks(url, extraHeaders, controller) {
+  const isAssetDelivery = (() => {
+    try { return new URL(url).hostname === "assetdelivery.roblox.com"; } catch { return false; }
+  })();
+
+  if (config.openCloudApiKey && isAssetDelivery) {
+    const openCloudUrl = openCloudAssetDeliveryUrl(url);
+    if (openCloudUrl) {
+      try {
+        const apiResponse = await fetchAllowedRobloxUrl(openCloudUrl, controller.signal, {
+          ...extraHeaders,
+          "x-api-key": config.openCloudApiKey,
+        });
+        if (apiResponse.ok) {
+          const data = await apiResponse.json().catch(() => null);
+          const location = data?.location || data?.locations?.[0]?.location;
+          if (location && isAllowedRobloxAssetUrl(location)) {
+            const content = await fetchAllowedRobloxUrl(location, controller.signal, extraHeaders);
+            if (content.ok && content.body) {
+              log(`[proxy] OpenCloud: ${url.slice(0, 140)} → ${location.slice(0, 100)}`);
+              return { upstream: content, via: "opencloud" };
+            }
+            log(`[proxy] OpenCloud-Location HTTP ${content.status}: ${location.slice(0, 140)}`);
+          } else {
+            log(`[proxy] OpenCloud ohne location-Feld: ${openCloudUrl.slice(0, 140)}`);
+          }
+        } else {
+          log(`[proxy] OpenCloud HTTP ${apiResponse.status} ${openCloudUrl.slice(0, 140)} – Fallback auf assetdelivery`);
+        }
+      } catch (error) {
+        reportError("[proxy] OpenCloud-Fallback", error);
+      }
+    }
+  }
+
+  for (let attempt = 0; attempt <= 2; attempt += 1) {
+    const upstream = await fetchAllowedRobloxUrl(url, controller.signal, extraHeaders);
+    if (upstream.ok) return { upstream, via: "assetdelivery" };
+    const retryable = [429, 500, 502, 503, 504].includes(upstream.status);
+    if (!retryable || attempt === 2) return { upstream, via: "assetdelivery" };
+    try { await upstream.body?.cancel?.(); } catch { /* ignore */ }
+    const wait = 400 * 2 ** attempt;
+    log(`[proxy] HTTP ${upstream.status} ${url.slice(0, 160)} – Retry in ${wait} ms (${attempt + 1}/2)`);
+    await sleep(wait);
+  }
+  // Nicht erreichbar: alle Pfade oben enden in `return`.
+  return { upstream: null, via: "assetdelivery" };
+}
+
 app.get("/roblox-proxy", async (request, response) => {
   const url = String(request.query.url || "");
   if (!isAllowedRobloxAssetUrl(url)) return response.status(400).json({ error: "URL nicht erlaubt" });
@@ -254,22 +312,18 @@ app.get("/roblox-proxy", async (request, response) => {
   }
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 45_000);
+  // Header-Phase (bis die erste Antwort da ist) und Stream-Phase getrennt
+  // begrenzen: Der Browser bricht nach 60 s ohne Header ab, große Assets dürfen
+  // beim Streamen aber deutlich länger brauchen (langsamer CDN auf 0,1 CPU).
+  let headerTimer = setTimeout(() => controller.abort(), 50_000);
+  let streamTimer = null;
   try {
-    let upstream;
-    for (let attempt = 0; attempt <= 2; attempt += 1) {
-      upstream = await fetchAllowedRobloxUrl(url, controller.signal, extraHeaders);
-      if (upstream.ok) break;
-      const retryable = [429, 500, 502, 503, 504].includes(upstream.status);
-      if (!retryable || attempt === 2) break;
-      try { await upstream.body?.cancel?.(); } catch { /* ignore */ }
-      const wait = 400 * 2 ** attempt;
-      log(`[proxy] HTTP ${upstream.status} ${url.slice(0, 160)} – Retry in ${wait} ms (${attempt + 1}/2)`);
-      await sleep(wait);
-    }
-    if (!upstream.ok || !upstream.body) {
-      log(`[proxy] HTTP ${upstream.status} ${url.slice(0, 220)}`);
-      return response.status(upstream.status).end();
+    const { upstream } = await fetchUpstreamWithFallbacks(url, extraHeaders, controller);
+    clearTimeout(headerTimer);
+    headerTimer = null;
+    if (!upstream || !upstream.ok || !upstream.body) {
+      log(`[proxy] HTTP ${upstream?.status ?? "?"} ${url.slice(0, 220)}`);
+      return response.status(upstream?.status ?? 502).end();
     }
 
     const declaredSize = Number(upstream.headers.get("content-length") || 0);
@@ -289,12 +343,14 @@ app.get("/roblox-proxy", async (request, response) => {
         else callback(null, chunk);
       },
     });
+    streamTimer = setTimeout(() => controller.abort(), 180_000);
     await pipeline(upstream.body, limiter, response);
   } catch (error) {
     if (!response.headersSent) response.status(error?.name === "AbortError" ? 504 : 502).json({ error: "Roblox-Asset konnte nicht geladen werden" });
     else response.destroy(error);
   } finally {
-    clearTimeout(timeout);
+    clearTimeout(headerTimer);
+    clearTimeout(streamTimer);
   }
 });
 
@@ -425,7 +481,11 @@ async function renderAvatar(userId, onProgress) {
       if (!canvas) throw new Error("Renderer hat keine Bildfläche erzeugt.");
       const png = await canvas.screenshot({ type: "png", optimizeForSpeed: true });
       log(`[render] userId=${userId}: PNG erzeugt, ${(png.length / 1024).toFixed(0)} KB (${elapsed()}).`);
-      return png;
+      const skippedAssets = Array.isArray(state?.skippedAssets) ? state.skippedAssets : [];
+      if (skippedAssets.length) {
+        log(`[render] userId=${userId}: ${skippedAssets.length} Asset(s) übersprungen: ${skippedAssets.slice(0, 12).join(", ")}`);
+      }
+      return { png, skippedAssets };
     } finally {
       clearInterval(progressTimer);
     }
@@ -448,8 +508,8 @@ app.get("/render-debug", async (request, response) => {
   busy = true;
   activeJob = `debug:${userId}`;
   try {
-    const png = await renderAvatar(userId, () => {});
-    response.json({ ok: true, userId, bytes: png.length, build: getBuildInfo() });
+    const { png, skippedAssets } = await renderAvatar(userId, () => {});
+    response.json({ ok: true, userId, bytes: png.length, skippedAssets, build: getBuildInfo() });
   } catch (error) {
     response.status(500).json({
       ok: false,
@@ -521,7 +581,7 @@ async function handleRender(interaction) {
     }
     update("Avatar-Daten wurden gefunden. Render wird vorbereitet …", true);
 
-    const png = await renderAvatar(activeJobUser.id, (_phase, message) => update(message));
+    const { png, skippedAssets } = await renderAvatar(activeJobUser.id, (_phase, message) => update(message));
     clearInterval(heartbeat);
     heartbeat = undefined;
     await editChain;
@@ -537,6 +597,14 @@ async function handleRender(interaction) {
         { name: "User-ID", value: String(activeJobUser.id), inline: true },
         { name: "Dauer", value: `${Math.floor((Date.now() - startedAt) / 1000)} s`, inline: true },
       );
+    if (skippedAssets?.length) {
+      const list = skippedAssets.slice(0, 8).map((id) => `rbxassetid://${id}`).join(", ");
+      const more = skippedAssets.length > 8 ? ` (+${skippedAssets.length - 8} weitere)` : "";
+      doneEmbed.addFields({
+        name: `⚠️ ${skippedAssets.length} Asset(s) übersprungen`,
+        value: `Roblox liefert diese Assets ohne Authentifizierung nicht mehr (HTTP 401 seit April 2025). ${list}${more}. Mit \`ROBLOX_OPENCLOUD_API_KEY\` werden sie nachgeladen.`,
+      });
+    }
     await interaction.editReply({ embeds: [doneEmbed], files: [attachment] });
   } catch (error) {
     reportError("[render] Render fehlgeschlagen", error);

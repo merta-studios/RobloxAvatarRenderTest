@@ -30,6 +30,11 @@ export const config = {
   skipDiscord: (process.env.SKIP_DISCORD ?? "false") === "true",
   // GET /render-debug?userId=… (kein Discord). Nur bewusst einschalten.
   debugRenderEndpoint: (process.env.DEBUG_RENDER_ENDPOINT ?? "false") === "true",
+  // Optionaler OpenCloud-API-Key (https://create.roblox.com/dashboard/credentials).
+  // Roblox liefert UGC-Assets (Kleidung, Accessoires) seit April 2025 nur noch
+  // mit Authentifizierung aus; ohne Key werden solche Assets übersprungen.
+  // Mit Key lädt der Proxy sie über apis.roblox.com/asset-delivery-api nach.
+  openCloudApiKey: process.env.ROBLOX_OPENCLOUD_API_KEY?.trim() || "",
 };
 
 const TOKEN_PATTERN = /^[\w-]{20,}\.[\w-]{5,}\.[\w-]{20,}$/;
