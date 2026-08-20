@@ -61,7 +61,7 @@ Der Bot braucht **keinen Roblox-Cookie**. Niemals `.ROBLOSECURITY` als Environme
 | `DISCORD_GUILD_ID` | ID des Testservers (empfohlen) |
 
 5. Deploy starten.
-6. In den Logs müssen nacheinander `[http] HTTP: Port …`, die `[diagnose]`-Zeilen (DNS, TCP, REST-Probe), `[login] Versuch 1/3: Verbinde mit dem Discord-Gateway …`, `[gateway] Discord: eingeloggt als …` und `[commands] … Command(s) registriert …` erscheinen. **Die Netzwerk-Diagnose und der Gateway-Login passieren bewusst vor der Command-Registrierung** – erst wenn der Bot online ist, wird per REST registriert.
+6. In den Logs müssen nacheinander `[http] HTTP: Port …`, die `[diagnose]`-Zeilen (DNS, TCP, REST-Probe), `[preflight] Token akzeptiert …`, `[login] Versuch 1: Verbinde mit dem Discord-Gateway …`, `[gateway] Discord: eingeloggt als …` und `[commands] … Command(s) registriert …` erscheinen. **Die Netzwerk-Diagnose und der Gateway-Login passieren bewusst vor der Command-Registrierung** – erst wenn der Bot online ist, wird per REST registriert.
 7. Auf dem Testserver `/render_avatar username:Builderman` ausprobieren.
 
 Mit `DISCORD_GUILD_ID` erscheint der Command normalerweise sofort. Ohne diese Variable wird er global registriert; globale Discord-Commands können verzögert sichtbar werden.
@@ -106,12 +106,14 @@ Siehe `.env.example`.
 | `CHROMIUM_PATH` | nein | `/usr/bin/chromium` | Chromium im Docker-Image |
 | `RENDER_TIMEOUT_SECONDS` | nein | `420` | 60–840 Sekunden |
 | `MAX_ASSET_MB` | nein | `30` | Maximalgröße je Roblox-Asset, 5–60 MB |
-| `REST_TIMEOUT_SECONDS` | nein | `30` | Timeout pro REST-Anfrage, 5–300 Sekunden |
-| `LOGIN_TIMEOUT_SECONDS` | nein | `60` | Maximale Zeit für den Gateway-Login, 10–600 Sekunden |
-| `LOGIN_ATTEMPTS` | nein | `3` | Anzahl der Gateway-Login-Versuche beim Start, 1–10 |
-| `LOGIN_BACKOFF_SECONDS` | nein | `5` | Wartezeit zwischen Login-Versuchen, 0–60 Sekunden |
+| `REST_TIMEOUT_SECONDS` | nein | `20` | Timeout pro REST-Anfrage, 5–300 Sekunden |
+| `LOGIN_TIMEOUT_SECONDS` | nein | `90` | Maximale Zeit für den Gateway-Login, 10–600 Sekunden |
+| `LOGIN_ATTEMPTS` | nein | `0` | Gateway-Login-Versuche; `0` = unbegrenzt weiterversuchen (empfohlen), sonst 1–100 |
+| `LOGIN_BACKOFF_SECONDS` | nein | `5` | Start-Wartezeit zwischen Login-Versuchen, 0–60 Sekunden (verdoppelt sich) |
+| `LOGIN_BACKOFF_MAX_SECONDS` | nein | `300` | Obergrenze für das Backoff, 5–3600 Sekunden |
+| `AUTO_SELECT_FAMILY` | nein | `false` | Node „Happy Eyeballs“ (paralleles IPv4/IPv6-Verbinden) wieder aktivieren |
 | `DNS_RESULT_ORDER` | nein | `ipv4first` | DNS-Reihenfolge: `ipv4first` (Standard) behebt Verbindungs-Hänger in Containern ohne IPv6-Route; `verbatim` nutzt die System-Reihenfolge |
-| `HEALTH_REQUIRE_DISCORD` | nein | `true` | `/health` antwortet mit 503, solange der Bot nicht mit Discord verbunden ist |
+| `HEALTH_REQUIRE_DISCORD` | nein | `false` | Wenn `true`, antwortet `/health` mit 503, solange der Bot nicht mit Discord verbunden ist |
 | `DISCORD_DEBUG` | nein | `false` | Ausführliche Debug-Logs von discord.js (REST/WebSocket) |
 
 ## Startreihenfolge, Timeouts und Diagnose
@@ -120,16 +122,17 @@ Beim Start passiert Folgendes – jede Phase loggt mit eigenem Tag und Zeitstemp
 
 1. **`[http]`** Der HTTP-Server öffnet den Port, damit der Render-Healthcheck erreichbar ist.
 2. **`[diagnose]`** Vor dem Login wird die Netzwerkstrecke zu Discord geprüft: DNS-Auflösung von `gateway.discord.gg`, rohe TCP-Probe auf Port 443 und REST-Probe auf `https://discord.com/api/v10/gateway` – jeweils mit eigenem Zeitlimit und Log. Damit ist sofort sichtbar, auf welcher Ebene eine Verbindung hängt (DNS → TCP → TLS/REST → WebSocket).
-3. **`[login]`** Der Bot verbindet sich mit dem **Discord-Gateway**. Es gibt bis zu `LOGIN_ATTEMPTS` Versuche (Standard 3, Abstand `LOGIN_BACKOFF_SECONDS`); jeder Versuch nutzt einen frischen Client und hat das Timeout `LOGIN_TIMEOUT_SECONDS`. Erst nach dem letzten fehlgeschlagenen Versuch wird der Prozess mit Fehlercode 1 beendet, damit Render den Container neu starten kann. So hängt der Bot nie lautlos fest.
-4. **`[commands]`** Erst nach erfolgreichem Login wird der Slash-Command per REST registriert. Jede einzelne REST-Anfrage hat ein Timeout (`REST_TIMEOUT_SECONDS`), die gesamte Registrierung zusätzlich eine harte Deadline (3 Versuche à Timeout plus Puffer). Scheitert die Registrierung, **bleibt der Bot online** und der Fehler ist in Logs und `/health` sichtbar.
+3. **`[preflight]`** Vor jedem Login-Versuch wird `GET /gateway/bot` **mit dem echten Bot-Token** und regelkonformem `DiscordBot`-User-Agent abgefragt – mit hartem Zeitlimit. Damit steht sofort im Log, ob der Token gültig ist (401), ob Cloudflare blockt bzw. rate-limitet (HTML-Antwort, `cloudflare-error=…`, `cf-ray=…`) oder ob das Session-Start-Limit erschöpft ist. Ein ungültiger Token führt zum sauberen Abbruch statt zu endlosen Neustarts.
+4. **`[login]`** Der Bot verbindet sich mit dem **Discord-Gateway**. Jeder Versuch nutzt einen frischen Client, hat das Timeout `LOGIN_TIMEOUT_SECONDS` und gilt erst als erfolgreich, wenn das `ClientReady`-Event kommt. Zwischen den Versuchen wächst die Wartezeit exponentiell (`LOGIN_BACKOFF_SECONDS` bis `LOGIN_BACKOFF_MAX_SECONDS`). Mit `LOGIN_ATTEMPTS=0` (Standard) versucht der Prozess es dauerhaft weiter, statt sich zu beenden – der Bot kommt so von allein zurück, sobald Discord wieder erreichbar ist.
+5. **`[commands]`** Erst nach erfolgreichem Login wird der Slash-Command per REST registriert. Jede einzelne REST-Anfrage hat ein Timeout (`REST_TIMEOUT_SECONDS`), die gesamte Registrierung zusätzlich eine harte Deadline (3 Versuche à Timeout plus Puffer). Scheitert die Registrierung, **bleibt der Bot online** und der Fehler ist in Logs und `/health` sichtbar.
 
 Gateway-Ereignisse (Reconnect, Disconnect, Shard-Fehler, Warnungen) werden unter `[gateway]` bzw. `[discord]` geloggt. Während der Login-Phase laufen die rohen discord.js-Debug-Logs automatisch mit (`[debug]`); dauerhaft lassen sie sich mit `DISCORD_DEBUG=true` aktivieren, Fehler werden dann zusätzlich mit allen Details ausgegeben. Bot-Tokens werden in Logs und Health-Antworten grundsätzlich geschwärzt (`[REDACTED]`).
 
 ### IPv4 zuerst
 
-Standardmäßig startet der Prozess mit `dns.setDefaultResultOrder("ipv4first")` und schaltet Node's „Happy Eyeballs“-Versuch ab (`net.setDefaultAutoSelectFamily(false)`). In Containern ohne IPv6-Route verhindert das bekannte Verbindungs-Hänger zum Discord-Gateway (Node 22 versucht sonst zuerst IPv6). Über `DNS_RESULT_ORDER=verbatim` lässt sich auf die System-Reihenfolge umschalten.
+Standardmäßig startet der Prozess mit `dns.setDefaultResultOrder("ipv4first")` und schaltet Node's „Happy Eyeballs“-Versuch ab (`net.setDefaultAutoSelectFamily(false)`, wieder aktivierbar über `AUTO_SELECT_FAMILY=true`). In Containern ohne IPv6-Route verhindert das bekannte Verbindungs-Hänger zum Discord-Gateway (Node 22 versucht sonst zuerst IPv6). Über `DNS_RESULT_ORDER=verbatim` lässt sich auf die System-Reihenfolge umschalten.
 
-**Healthcheck:** `GET /health` liefert standardmäßig **503**, solange der Bot nicht mit Discord verbunden ist, und **200**, sobald er bereit ist. Die Antwort enthält den Discord-Status (User, Ping, Gateway, letzter Fehler) sowie den Stand der Command-Registrierung:
+**Healthcheck:** `GET /health` liefert standardmäßig **200**, sobald der HTTP-Server läuft – auch während der Bot noch auf Discord wartet. Das ist Absicht: Ein 503 lässt Render den Container töten und erzeugt eine Neustart-Schleife, in der der Bot nie online kommt. Mit `HEALTH_REQUIRE_DISCORD=true` antwortet `/health` wie früher mit 503, solange Discord nicht verbunden ist. Die Antwort enthält den Discord-Status (User, Ping, Gateway, letzter Fehler) sowie den Stand der Command-Registrierung:
 
 ```json
 {
@@ -142,26 +145,35 @@ Standardmäßig startet der Prozess mit `dns.setDefaultResultOrder("ipv4first")`
 }
 ```
 
-Damit markiert Render den Service als ungesund, wenn der Bot nicht online ist – statt wie bisher ein „ok“ zu melden, obwohl der Bot nie verbunden war. Falls Render den Service dadurch zu aggressiv neu startet (z. B. während Discord-Ausfällen), kann der Healthcheck mit `HEALTH_REQUIRE_DISCORD=false` wieder auf „immer ok“ gestellt werden; der Discord-Status bleibt in der Antwort trotzdem sichtbar.
+Der tatsächliche Verbindungsstand steht immer im Feld `discord` (`status`, `loginAttempt`, `nextRetryAt`, `lastPreflight`, `lastLoginError`) – auch wenn der Healthcheck 200 meldet.
 
 ## Troubleshooting: Bot bleibt offline / Login hängt
 
-Bleiben die Logs bei `[login] Versuch … Verbinde mit dem Discord-Gateway …` stehen, zeigen die `[diagnose]`-Zeilen vom Start, auf welcher Ebene die Verbindung hängt:
+Typisches Log-Muster: `[login] Versuch 1/3: Verbinde mit dem Discord-Gateway …`, dann `[debug] Preparing to connect to the gateway...` und danach nichts mehr bis zum Timeout. Das heißt praktisch immer: **die REST-Anfrage `/gateway/bot`, die discord.js intern vor dem WebSocket macht, kommt nicht durch.** Die `[preflight]`-Zeile zeigt jetzt den Grund im Klartext:
+
+| Log-Zeile | Bedeutung | Lösung |
+|---|---|---|
+| `[preflight] Discord lehnt den Token ab (HTTP 401 …)` | Token falsch, abgelaufen oder mit Präfix/Leerzeichen kopiert | Im Developer Portal **Bot → Reset Token**, neuen Wert in Render als `DISCORD_TOKEN` speichern (ohne `Bot `-Präfix, ohne Anführungszeichen) und Service neu deployen |
+| `cloudflare-error=1015` / `HTTP 429` | Rate Limit auf der (geteilten) Ausgangs-IP – auf Render Free häufig | Warten (der Bot versucht es mit wachsendem Backoff selbst weiter), Region wechseln oder auf einen kostenpflichtigen Plan mit anderer IP gehen |
+| `cloudflare-error=1010` / HTML-Antwort | Anfrage wurde von Cloudflare geblockt (z. B. wegen unpassendem User-Agent) | Ist im Code behoben: alle Anfragen laufen mit gültigem `DiscordBot`-User-Agent |
+| `[preflight] … nicht erreichbar: … fetch failed` | Egress-Block, Proxy oder TLS-Problem im Container | Netzwerk/Region prüfen, `curl` aus der Render-Shell testen (siehe unten) |
+| `[preflight] Token akzeptiert …`, aber der Gateway-Login läuft ins Timeout | WebSocket-Strecke ist blockiert oder IPv6 hängt | `DNS_RESULT_ORDER=ipv4first` (Standard) beibehalten, ggf. Region wechseln, `DISCORD_DEBUG=true` setzen |
+
+Die `[diagnose]`-Zeilen vom Start zeigen zusätzlich, auf welcher Ebene es hakt:
 
 - **DNS** (`[diagnose] DNS gateway.discord.gg: …`): Fehler oder nur IPv6-Adressen → DNS-/Netzwerkproblem im Container.
 - **TCP** (`[diagnose] TCP gateway.discord.gg:443 …`): `FEHLER` oder Timeout → Port 443 ist aus dem Container nicht erreichbar (Egress-Block, Region).
-- **REST** (`[diagnose] REST https://discord.com/api/v10/gateway: HTTP …`): Scheitert bereits TLS/REST, liegt es an der Netzstrecke oder einem Proxy dazwischen.
-- Sind DNS, TCP und REST in Ordnung, hängt aber der WebSocket-Login trotzdem, ist das ein bekanntes Muster auf Cloud-Plattformen (Node 22 versucht IPv6 zuerst; Container ohne IPv6-Route bleiben hängen – identische Symptome wurden z. B. von Railway-Nutzern berichtet, dort half teils ein Regionswechsel). Dagegen wirken `DNS_RESULT_ORDER=ipv4first` (Standard), die automatischen `[debug]`-Logs während der Login-Phase und gegebenenfalls ein Regionswechsel auf Render.
+- **REST** (`[diagnose] REST /gateway: HTTP …`): Kommt hier HTML statt JSON zurück, steht der genaue Cloudflare-Fehlercode samt `cf-ray` im Log.
 
 Im Render-Service per Shell testen:
 
 ```bash
-curl -v --max-time 10 https://discord.com/api/v10/gateway
-node -e "const s=require('net').connect(443,'gateway.discord.gg');s.setTimeout(5000,()=>{console.log('TCP-Timeout');process.exit(1)});s.on('connect',()=>console.log('TCP ok'));s.on('error',e=>console.log('TCP-Fehler:',e.message))"
+curl -v --max-time 10 -H 'User-Agent: DiscordBot (https://example.com, 1.0.0)' https://discord.com/api/v10/gateway
+curl -s --max-time 10 -H "Authorization: Bot $DISCORD_TOKEN" -H 'User-Agent: DiscordBot (https://example.com, 1.0.0)' https://discord.com/api/v10/users/@me
 curl -s localhost:10000/health
 ```
 
-`curl -v` zeigt TLS-Fehler, die Node-Probe testet die rohe TCP-Verbindung zu Port 443, und `/health` meldet den laufenden Login-Versuch samt `lastLoginError`.
+Liefert `/users/@me` ein JSON mit der Bot-ID, ist der Token in Ordnung; kommt `401`, muss der Token erneuert werden. `/health` zeigt den laufenden Versuch samt `lastPreflight` und `lastLoginError`.
 
 ## Lokal entwickeln
 

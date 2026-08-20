@@ -23,9 +23,16 @@ import { isAllowedRobloxAssetUrl, resolveRobloxUser, RobloxError } from "./roblo
 
 const dnsOrder = process.env.DNS_RESULT_ORDER === "verbatim" ? "verbatim" : "ipv4first";
 setDefaultResultOrder(dnsOrder);
-net.setDefaultAutoSelectFamily(false);
+net.setDefaultAutoSelectFamily(config.autoSelectFamily);
 
-validateBotConfig();
+/**
+ * Discord/Cloudflare beantwortet Anfragen mit fremdem User-Agent mit einer
+ * HTML-Fehlerseite (z. B. "error 1010") statt mit JSON. Alle eigenen Anfragen an
+ * die Discord-API laufen deshalb mit einem regelkonformen Bot-User-Agent.
+ */
+const DISCORD_USER_AGENT = "DiscordBot (https://github.com/merta-studios/RobloxAvatarRenderTest, 1.0.0)";
+
+const configWarnings = validateBotConfig();
 let busy = false;
 let activeJob = null;
 
@@ -115,23 +122,112 @@ async function diagnoseNetwork() {
   }
 
   try {
-    const response = await fetch("https://discord.com/api/v10/gateway", {
-      signal: AbortSignal.timeout(10_000),
-      headers: { "user-agent": "AvatarRenderTest/1.0" },
-    });
-    const body = await response.json();
-    log(`[diagnose] REST https://discord.com/api/v10/gateway: HTTP ${response.status}, empfohlenes Gateway: ${redactSecrets(body.url)}`);
+    const probe = await discordApi("/gateway", { timeoutMs: 15_000 });
+    if (probe.json?.url) {
+      log(`[diagnose] REST /gateway: HTTP ${probe.status}, empfohlenes Gateway: ${redactSecrets(probe.json.url)}`);
+    } else {
+      logError(`[diagnose] REST /gateway lieferte kein JSON: ${describeHttpProblem(probe)}`);
+    }
   } catch (error) {
     reportError("[diagnose] REST-Probe auf https://discord.com/api/v10/gateway fehlgeschlagen", error);
   }
 }
 
+/**
+ * Einzelne Anfrage an die Discord-API mit hartem Zeitlimit, korrektem User-Agent
+ * und toleranter Body-Auswertung (Cloudflare antwortet im Fehlerfall mit HTML).
+ */
+async function discordApi(path, { timeoutMs = config.restTimeoutMs, authorized = false } = {}) {
+  const headers = { "user-agent": DISCORD_USER_AGENT, accept: "application/json" };
+  if (authorized) headers.authorization = `Bot ${config.token}`;
+  const response = await fetch(`https://discord.com/api/v10${path}`, {
+    headers,
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  const text = await response.text();
+  let json = null;
+  try {
+    json = JSON.parse(text);
+  } catch {
+    json = null;
+  }
+  return {
+    status: response.status,
+    ok: response.ok,
+    json,
+    text,
+    contentType: response.headers.get("content-type") || "",
+    cfRay: response.headers.get("cf-ray"),
+    retryAfter: response.headers.get("retry-after"),
+  };
+}
+
+/** Baut aus einer Nicht-JSON-Antwort (HTML/Cloudflare) eine kurze, aussagekräftige Log-Zeile. */
+function describeHttpProblem(result) {
+  const cloudflareCode = /error code:?\s*(\d{3,4})/i.exec(result.text)?.[1]
+    || /Cloudflare Ray ID.*?\b(1\d{3})\b/i.exec(result.text)?.[1];
+  const title = /<title[^>]*>([^<]{0,120})<\/title>/i.exec(result.text)?.[1]?.trim();
+  const parts = [`HTTP ${result.status}`, `content-type=${result.contentType || "?"}`];
+  if (title) parts.push(`title="${title}"`);
+  if (cloudflareCode) parts.push(`cloudflare-error=${cloudflareCode}`);
+  if (result.cfRay) parts.push(`cf-ray=${result.cfRay}`);
+  if (result.retryAfter) parts.push(`retry-after=${result.retryAfter}`);
+  if (!title && !cloudflareCode) parts.push(`body="${redactSecrets(result.text.slice(0, 160).replace(/\s+/g, " "))}"`);
+  return parts.join(", ");
+}
+
+/**
+ * Prüft vor dem Gateway-Login mit dem echten Token, ob die Discord-API überhaupt
+ * erreichbar ist und ob der Token gültig ist. Ohne diese Prüfung hängt
+ * discord.js beim internen Abruf von /gateway/bot bis ins Login-Timeout, ohne je
+ * zu verraten, warum (genau das Muster aus den Render-Logs).
+ *
+ * @returns {Promise<{ok: boolean, fatal: boolean, reason: string|null}>}
+ */
+async function preflightDiscordAuth() {
+  let result;
+  try {
+    result = await discordApi("/gateway/bot", { authorized: true, timeoutMs: config.restTimeoutMs });
+  } catch (error) {
+    reportError("[preflight] /gateway/bot nicht erreichbar", error);
+    return { ok: false, fatal: false, reason: `Netzwerkfehler: ${error?.message || error}` };
+  }
+
+  if (result.ok && result.json?.url) {
+    const limit = result.json.session_start_limit;
+    log(`[preflight] Token akzeptiert. Gateway ${redactSecrets(result.json.url)}, empfohlene Shards: ${result.json.shards}${limit ? `, Session-Starts übrig: ${limit.remaining}/${limit.total} (Reset in ${Math.round((limit.reset_after ?? 0) / 1000)} s)` : ""}.`);
+    if (limit && limit.remaining <= 0) {
+      return { ok: false, fatal: false, reason: `Session-Start-Limit erschöpft, Reset in ${Math.round((limit.reset_after ?? 0) / 1000)} s.` };
+    }
+    return { ok: true, fatal: false, reason: null };
+  }
+
+  if (result.status === 401) {
+    logError("[preflight] Discord lehnt den Token ab (HTTP 401 Unauthorized). Bitte im Developer Portal unter Bot → Reset Token einen neuen Token erzeugen und DISCORD_TOKEN in Render aktualisieren (ohne Präfix 'Bot ', ohne Anführungszeichen/Leerzeichen).");
+    return { ok: false, fatal: true, reason: "Ungültiger Bot-Token (HTTP 401)." };
+  }
+  if (result.status === 403) {
+    logError(`[preflight] Discord antwortet mit HTTP 403: ${describeHttpProblem(result)}`);
+    return { ok: false, fatal: false, reason: "HTTP 403 von Discord." };
+  }
+  if (result.status === 429) {
+    const retryAfter = Number(result.json?.retry_after ?? result.retryAfter ?? 0);
+    logError(`[preflight] Rate Limit von Discord/Cloudflare: ${describeHttpProblem(result)}. Das trifft auf geteilten Hosting-IPs (z. B. Render Free) regelmäßig zu.`);
+    return { ok: false, fatal: false, reason: `Rate Limit, retry_after=${retryAfter}s.` };
+  }
+  logError(`[preflight] Unerwartete Antwort von /gateway/bot: ${describeHttpProblem(result)}`);
+  return { ok: false, fatal: false, reason: `Unerwartete Antwort (HTTP ${result.status}).` };
+}
+
 const botState = {
-  status: "offline", // offline | connecting | ready | reconnecting
+  status: "offline", // offline | connecting | ready | reconnecting | waiting
   readyAt: null,
   userTag: null,
+  loginAttempt: 0,
+  nextRetryAt: null,
   lastGatewayError: null,
   lastLoginError: null,
+  lastPreflight: null,
   commandRegistration: { state: "pending", startedAt: null, target: null, count: 0, durationMs: null, error: null },
 };
 
@@ -150,10 +246,13 @@ app.get("/health", (_request, response) => {
       status: botState.status,
       user: botState.userTag,
       readyAt: botState.readyAt,
+      loginAttempt: botState.loginAttempt,
+      nextRetryAt: botState.nextRetryAt,
       ping: client?.ws?.ping ?? null,
       gateway: client?.ws?.gateway ?? null,
       lastError: botState.lastGatewayError,
       lastLoginError: botState.lastLoginError,
+      lastPreflight: botState.lastPreflight,
     },
     commands: botState.commandRegistration,
   });
@@ -379,7 +478,18 @@ let verboseLogin = false;
 
 /** Frischer Client je Login-Versuch; Logs alter Instanzen werden über isCurrent() unterdrückt. */
 function createClient() {
-  const newClient = new Client({ intents: [GatewayIntentBits.Guilds] });
+  const newClient = new Client({
+    intents: [GatewayIntentBits.Guilds],
+    // Ohne diese Optionen nutzt discord.js 15 s Timeout und 3 Retries je REST-Anfrage.
+    // Beim internen Abruf von /gateway/bot summiert sich das lautlos auf ~60 s –
+    // exakt das Login-Timeout aus den Logs. Ein Versuch mit klarem Zeitlimit
+    // scheitert stattdessen schnell und sichtbar.
+    rest: {
+      timeout: config.restTimeoutMs,
+      retries: 1,
+      userAgentAppendix: "RobloxAvatarRenderTest",
+    },
+  });
   const isCurrent = () => newClient === client;
 
   newClient.on(Events.ClientReady, (readyClient) => {
@@ -423,7 +533,8 @@ function createClient() {
   newClient.on(Events.Invalidated, () => {
     if (!isCurrent()) return;
     botState.status = "offline";
-    logError("[gateway] Sitzung invalidiert (Token zurückgezogen?). Neustart erforderlich.");
+    logError("[gateway] Sitzung invalidiert (Token zurückgezogen oder Session abgelaufen). Es wird automatisch neu verbunden.");
+    void restartLogin("Sitzung invalidiert");
   });
   // Während der Login-Phase laufen die Debug-Logs automatisch mit (verboseLogin),
   // danach nur noch mit DISCORD_DEBUG=true. Tokens werden grundsätzlich geschwärzt.
@@ -439,45 +550,90 @@ function createClient() {
   return newClient;
 }
 
-async function startBot() {
+/**
+ * Ein einzelner Login-Versuch. `client.login()` gilt erst dann als erfolgreich,
+ * wenn der Gateway auch wirklich READY meldet – sonst würde ein aufgelöstes
+ * Login-Promise ohne Ready-Event den Bot „online“ erscheinen lassen, obwohl er offline ist.
+ */
+async function loginOnce() {
+  const previous = client;
+  client = createClient();
+  const current = client;
+  if (previous) await previous.destroy().catch(() => {});
+
+  const ready = new Promise((resolve, reject) => {
+    current.once(Events.ClientReady, resolve);
+    current.once(Events.Invalidated, () => reject(new Error("Discord hat die Sitzung invalidiert (Token ungültig oder zurückgezogen).")));
+  });
+
+  try {
+    await withTimeout(Promise.all([current.login(config.token), ready]), config.loginTimeoutMs, "Discord-Login");
+  } catch (error) {
+    // Wichtig: awaiten, damit Sockets und laufende REST-Anfragen des gescheiterten
+    // Versuchs wirklich abgeräumt sind, bevor der nächste Versuch startet.
+    await current.destroy().catch(() => {});
+    if (client === current) client = undefined;
+    throw error;
+  }
+}
+
+/** Login-Schleife mit exponentiellem Backoff. Läuft (Standard) unbegrenzt weiter, statt den Prozess sterben zu lassen. */
+async function connectWithRetries() {
+  const unlimited = config.loginAttempts === 0;
   const startedAt = Date.now();
-  log(`[startup] Start (Node ${process.version}, PID ${process.pid}).`);
-  log(`[startup] App-ID ${config.applicationId}, Commands ${config.guildId ? `nur für Guild ${config.guildId}` : "global"}, REST-Timeout ${config.restTimeoutMs / 1000} s, Login-Timeout ${config.loginTimeoutMs / 1000} s, Login-Versuche ${config.loginAttempts} (Abstand ${config.loginBackoffMs / 1000} s), DNS-Reihenfolge ${dnsOrder}, Healthcheck erfordert Discord: ${config.healthRequireDiscord ? "ja" : "nein"}, Debug-Logs ${config.debug ? "an" : "aus"}.`);
-
-  // 1) Netzwerk-Diagnose vor dem Login: zeigt in den Logs, auf welcher Ebene es hängt (DNS → TCP → TLS/REST → WebSocket).
-  await diagnoseNetwork();
-
-  // 2) Gateway-Login mit Retries: Erst wenn der Bot online ist, wird die Command-Registrierung versucht.
   verboseLogin = true;
-  let loginError = null;
-  for (let attempt = 1; attempt <= config.loginAttempts; attempt += 1) {
-    client = createClient();
-    botState.status = `connecting (Versuch ${attempt}/${config.loginAttempts})`;
-    log(`[login] Versuch ${attempt}/${config.loginAttempts}: Verbinde mit dem Discord-Gateway (Timeout: ${config.loginTimeoutMs / 1000} s) …`);
-    try {
-      await withTimeout(client.login(config.token), config.loginTimeoutMs, "Discord-Login");
-      loginError = null;
-      log(`[login] Login abgeschlossen nach ${((Date.now() - startedAt) / 1000).toFixed(1)} s (Versuch ${attempt}).`);
-      break;
-    } catch (error) {
-      loginError = error;
-      botState.lastLoginError = redactSecrets(error?.message || String(error));
-      reportError(`[login] Versuch ${attempt}/${config.loginAttempts} fehlgeschlagen`, error);
-      client.destroy();
-      if (attempt < config.loginAttempts) {
-        log(`[login] Nächster Versuch in ${config.loginBackoffMs / 1000} s …`);
-        await sleep(config.loginBackoffMs);
-      }
+
+  for (let attempt = 1; unlimited || attempt <= config.loginAttempts; attempt += 1) {
+    const label = unlimited ? `${attempt}` : `${attempt}/${config.loginAttempts}`;
+    botState.loginAttempt = attempt;
+    botState.status = `connecting (Versuch ${label})`;
+
+    // Vor jedem Versuch prüfen, ob die REST-API mit diesem Token antwortet.
+    const preflight = await preflightDiscordAuth();
+    botState.lastPreflight = preflight.reason ?? "ok";
+    if (preflight.fatal) {
+      botState.status = "offline";
+      botState.lastLoginError = preflight.reason;
+      verboseLogin = false;
+      logError("[login] Abbruch: Der hinterlegte Token ist ungültig. Ein Neustart würde nichts ändern – bitte DISCORD_TOKEN korrigieren.");
+      return false;
     }
-  }
-  if (loginError) {
-    verboseLogin = false;
-    logError(`[login] Alle ${config.loginAttempts} Versuche fehlgeschlagen nach ${((Date.now() - startedAt) / 1000).toFixed(1)} s. Prozess wird beendet, damit die Plattform einen Neustart versuchen kann.`);
-    shutdownNow(1);
-    return;
+
+    if (preflight.ok) {
+      log(`[login] Versuch ${label}: Verbinde mit dem Discord-Gateway (Timeout: ${config.loginTimeoutMs / 1000} s) …`);
+      try {
+        await loginOnce();
+        verboseLogin = false;
+        botState.lastLoginError = null;
+        botState.nextRetryAt = null;
+        log(`[login] Login abgeschlossen nach ${((Date.now() - startedAt) / 1000).toFixed(1)} s (Versuch ${label}).`);
+        return true;
+      } catch (error) {
+        botState.lastLoginError = redactSecrets(error?.message || String(error));
+        reportError(`[login] Versuch ${label} fehlgeschlagen`, error);
+      }
+    } else {
+      botState.lastLoginError = preflight.reason;
+      logError(`[login] Versuch ${label} übersprungen: Discord-REST-API nicht nutzbar (${preflight.reason}).`);
+    }
+
+    if (!unlimited && attempt >= config.loginAttempts) break;
+    // Exponentielles Backoff mit Deckel, damit Rate Limits nicht endlos angefeuert werden.
+    const delay = Math.min(config.loginBackoffMs * 2 ** Math.min(attempt - 1, 10), config.loginBackoffMaxMs);
+    botState.status = "waiting";
+    botState.nextRetryAt = new Date(Date.now() + delay).toISOString();
+    log(`[login] Nächster Versuch in ${Math.round(delay / 1000)} s …`);
+    await sleep(delay);
   }
 
-  // 3) Danach Command-Registrierung per REST, mit Zeitlimits auf beiden Ebenen.
+  verboseLogin = false;
+  botState.status = "offline";
+  logError(`[login] Alle ${config.loginAttempts} Versuche fehlgeschlagen nach ${((Date.now() - startedAt) / 1000).toFixed(1)} s.`);
+  return false;
+}
+
+/** Command-Registrierung per REST, mit Zeitlimits auf beiden Ebenen. */
+async function registerCommands() {
   const guildScoped = Boolean(config.guildId);
   const target = guildScoped ? `Guild ${config.guildId}` : "global";
   botState.commandRegistration = { state: "registering", startedAt: new Date().toISOString(), target, count: 0, durationMs: null, error: null };
@@ -499,10 +655,45 @@ async function startBot() {
     const durationMs = Date.now() - registrationStartedAt;
     botState.commandRegistration = { state: "failed", startedAt: botState.commandRegistration.startedAt, target, count: 0, durationMs, error: redactSecrets(error?.message || String(error)) };
     reportError(`[commands] Registrierung fehlgeschlagen nach ${(durationMs / 1000).toFixed(1)} s`, error);
-    logError("[commands] Der Bot bleibt online, der Slash-Command ist aber ggf. nicht verfügbar. Status: GET /health. (Die Anfrage läuft möglicherweise im Hintergrund weiter.)");
+    logError("[commands] Der Bot bleibt online, der Slash-Command ist aber ggf. nicht verfügbar. Status: GET /health.");
   }
 }
 
+let botRunning = false;
+
+/** Startet die Login-Schleife erneut (z. B. nach invalidierter Sitzung), ohne den Prozess zu beenden. */
+async function restartLogin(reason) {
+  if (botRunning) return;
+  log(`[login] Neuer Verbindungsaufbau (Auslöser: ${reason}).`);
+  await startBot({ diagnose: false });
+}
+
+async function startBot({ diagnose = true } = {}) {
+  if (botRunning) return;
+  botRunning = true;
+  try {
+    const startedAt = Date.now();
+    log(`[startup] Start (Node ${process.version}, PID ${process.pid}).`);
+    log(`[startup] App-ID ${config.applicationId}, Commands ${config.guildId ? `nur für Guild ${config.guildId}` : "global"}, REST-Timeout ${config.restTimeoutMs / 1000} s, Login-Timeout ${config.loginTimeoutMs / 1000} s, Login-Versuche ${config.loginAttempts === 0 ? "unbegrenzt" : config.loginAttempts} (Backoff ${config.loginBackoffMs / 1000}–${config.loginBackoffMaxMs / 1000} s), DNS-Reihenfolge ${dnsOrder}, Healthcheck erfordert Discord: ${config.healthRequireDiscord ? "ja" : "nein"}, Debug-Logs ${config.debug ? "an" : "aus"}.`);
+    for (const warning of configWarnings) logError(`[startup] Warnung: ${warning}`);
+
+    // 1) Netzwerk-Diagnose vor dem Login: zeigt in den Logs, auf welcher Ebene es hängt (DNS → TCP → TLS/REST → WebSocket).
+    if (diagnose) await diagnoseNetwork();
+
+    // 2) Preflight + Gateway-Login mit Backoff. Erst wenn der Bot online ist, wird registriert.
+    const connected = await connectWithRetries();
+    if (!connected) {
+      logError(`[login] Kein Login möglich nach ${((Date.now() - startedAt) / 1000).toFixed(1)} s. Prozess wird beendet, damit die Plattform einen Neustart versuchen kann.`);
+      shutdownNow(1);
+      return;
+    }
+
+    // 3) Danach Command-Registrierung per REST.
+    await registerCommands();
+  } finally {
+    botRunning = false;
+  }
+}
 const server = app.listen(config.port, "0.0.0.0", () => {
   log(`[http] HTTP: Port ${config.port} (Healthcheck: /health).`);
   void startBot();
