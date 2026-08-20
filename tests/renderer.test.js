@@ -96,6 +96,15 @@ test("Renderer hängt nicht mehr an einzelnen Assets: Guard, Deadline und Skip-R
   assert.match(client, /guardGetAssetBuffer/);
   assert.match(client, /ASSET_LOAD_DEADLINE_MS = 150_000/);
   assert.match(client, /API\.Asset\.GetAssetBuffer = guardGetAssetBuffer/);
+  // GetRBX deckt den RBXM-Pfad ab (fromBuffer wirft auf korrupten Formaten,
+  // die .then(resolve)-Ketten der Bibliothek haben kein catch).
+  assert.match(client, /guardGetRBX/);
+  assert.match(client, /GET_RBX_DEADLINE_MS = 190_000/);
+  assert.match(client, /API\.Asset\.GetRBX = guardGetRBX/);
+  // Animation-Ladepfade („Animation was already loaded“-Wettlauf u. a.) werden
+  // über die exportierten Prototype-Klassen entschärft – ohne node_modules-Eingriff.
+  assert.match(client, /patchAnimatorWrapper\(AnimatorWrapper/);
+  assert.match(client, /patchHumanoidDescriptionApply\(HumanoidDescriptionWrapper/);
   // Abgebrochene/failed Responses werden übersprungen statt den Render abzubrechen.
   assert.match(client, /skippedAssetIds/);
   assert.match(client, /state\.skippedAssets = \[\.\.\.skippedAssetIds\]/);
@@ -103,6 +112,17 @@ test("Renderer hängt nicht mehr an einzelnen Assets: Guard, Deadline und Skip-R
   // räumt ihr Loading-Label bei Fehlern nicht ab).
   assert.match(client, /getCurrentlyLoadingLabels/);
   assert.match(client, /filter\(\(label\) => !skippedAssetIds\.has/);
+});
+
+test("prepareForThumbnail bekommt eine Stall-erkennende Deadline unter dem 240-s-Watchdog", () => {
+  const client = readFileSync(new URL("src/renderer-client.js", root), "utf8");
+  // Die Bibliothek löst prepareForThumbnail evtl. NIE auf (interne .then(resolve)-
+  // Promises). Flache Deadlines würden legitime langsame Renders killen – deshalb
+  // bricht nur echter Stillstand (200 s < Watchdog 240 s) ab.
+  assert.match(client, /withStallDeadline\(outfitRenderer\.prepareForThumbnail\(\)/);
+  assert.match(client, /PREPARE_STALL_LIMIT_MS = 200_000/);
+  assert.match(client, /PREPARE_FLAT_LIMIT_MS = 400_000/);
+  assert.match(client, /getProgressSignature: \(\) =>/);
 });
 
 test("fetchWithTimeout bricht nur die Header-Phase ab, nicht den Body-Stream", () => {
@@ -120,4 +140,16 @@ test("Server-Proxy kennt den OpenCloud-Fallback für assetdelivery-401s", () => 
   assert.match(server, /x-api-key/);
   assert.match(server, /config\.openCloudApiKey/);
   assert.match(server, /skippedAssets/);
+});
+
+test("Discord-Fehlermeldung enthält Diagnose (Build, fehlgeschlagene Requests, Console)", () => {
+  const server = readFileSync(new URL("src/server.js", root), "utf8");
+  // Fix C: Statt nur der Phasen-Meldung sieht der User in Discord jetzt auch,
+  // WELCHE Requests/Console-Fehler den Render abgebrochen haben – und anhand
+  // der Build-ID, ob überhaupt der aktuelle Stand deployed ist.
+  assert.match(server, /error\?\.diagnostics/);
+  assert.match(server, /Diagnose:/);
+  assert.match(server, /diagnostics\.failedRequests/);
+  assert.match(server, /diagnostics\.consoleErrors/);
+  assert.match(server, /diagnostics\.buildId/);
 });

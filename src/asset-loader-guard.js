@@ -73,6 +73,43 @@ export function guardGetAssetBuffer(originalGetAssetBuffer, options = {}) {
 }
 
 /**
+ * Umhüllt `API.Asset.GetRBX` (Download + `rbx.fromBuffer`-Parsing). Die Aufrufer
+ * in der Bibliothek hängen an `.then(resolve)`-Promises OHNE Rejection-Handler
+ * (~50875, ~50903, ~49262, ~49285): Ein einziger Throw – z. B. wirft
+ * `rbx.fromBuffer()` auf korrupten/neuen RBXM-Formaten, oder `generateTree()`
+ * auf inkonsistenten Bäumen – lässt `Promise.all` in `_applyAnimations`/
+ * `loadAvatarAnimation` NIE auflösen. Der Render hängt dann still in Phase
+ * „assets“ mit LEERER Loading-Label-Liste („Kein Fortschritt seit 240 s“ ohne
+ * „Zuletzt geladen:“), weil alle Downloads längst fertig sind.
+ *
+ * Der Guard macht daraus Skip-Semantik wie bei GetAssetBuffer:
+ *  - Rejection (korrupter Buffer, Parse-Fehler) -> `undefined` (überspringen),
+ *  - kein Ergebnis innerhalb von `deadlineMs` -> `undefined` (überspringen).
+ *
+ * @param {(url: string, headers?: object, extraStr?: string) => Promise<unknown>} originalGetRBX
+ * @param {{ deadlineMs?: number, onSkipped?: (url: string) => void }} [options]
+ * @returns {(url: string, headers?: object, extraStr?: string) => Promise<unknown>}
+ */
+export function guardGetRBX(originalGetRBX, options = {}) {
+  const { deadlineMs = 190_000, onSkipped = () => {} } = options;
+  return function guardedGetRBX(url, headers, contentRepresentationPriorityList) {
+    let deadlineTimer;
+    const outcome = Promise.resolve(originalGetRBX(url, headers, contentRepresentationPriorityList))
+      .catch(() => {
+        onSkipped(url);
+        return undefined;
+      });
+    const deadline = new Promise((resolve) => {
+      deadlineTimer = setTimeout(() => {
+        onSkipped(url);
+        resolve(undefined);
+      }, deadlineMs);
+    });
+    return Promise.race([outcome, deadline]).finally(() => clearTimeout(deadlineTimer));
+  };
+}
+
+/**
  * Umhüllt `API.Asset.GetMesh`. Liefert die Bibliothek `undefined` (weil unser
  * GetAssetBuffer-Guard das Asset übersprungen hat), wird daraus eine
  * fehlgeschlagene Response – die Mesh-Verarbeitung (`compileMesh`) prüft auf
