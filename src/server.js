@@ -19,6 +19,7 @@ import {
 
 import { commands } from "./commands.js";
 import { config, validateBotConfig } from "./config.js";
+import { createDiscordNet } from "./discord-net.js";
 import { isAllowedRobloxAssetUrl, resolveRobloxUser, RobloxError } from "./roblox.js";
 
 const dnsOrder = process.env.DNS_RESULT_ORDER === "verbatim" ? "verbatim" : "ipv4first";
@@ -38,6 +39,7 @@ let activeJob = null;
 
 const log = (...args) => console.log(new Date().toISOString(), ...args);
 const logError = (...args) => console.error(new Date().toISOString(), ...args);
+const discordNet = createDiscordNet({ log });
 
 function redactSecrets(value) {
   if (typeof value !== "string" || !config.token) return value;
@@ -121,102 +123,65 @@ async function diagnoseNetwork() {
     reportError("[diagnose] TCP-Probe auf gateway.discord.gg:443 fehlgeschlagen", error);
   }
 
-  try {
-    const probe = await discordApi("/gateway", { timeoutMs: 15_000 });
-    if (probe.json?.url) {
-      log(`[diagnose] REST /gateway: HTTP ${probe.status}, empfohlenes Gateway: ${redactSecrets(probe.json.url)}`);
-    } else {
-      logError(`[diagnose] REST /gateway lieferte kein JSON: ${describeHttpProblem(probe)}`);
-    }
-  } catch (error) {
-    reportError("[diagnose] REST-Probe auf https://discord.com/api/v10/gateway fehlgeschlagen", error);
-  }
-}
-
-/**
- * Einzelne Anfrage an die Discord-API mit hartem Zeitlimit, korrektem User-Agent
- * und toleranter Body-Auswertung (Cloudflare antwortet im Fehlerfall mit HTML).
- */
-async function discordApi(path, { timeoutMs = config.restTimeoutMs, authorized = false } = {}) {
-  const headers = { "user-agent": DISCORD_USER_AGENT, accept: "application/json" };
-  if (authorized) headers.authorization = `Bot ${config.token}`;
-  const response = await fetch(`https://discord.com/api/v10${path}`, {
-    headers,
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-  const text = await response.text();
-  let json = null;
-  try {
-    json = JSON.parse(text);
-  } catch {
-    json = null;
-  }
-  return {
-    status: response.status,
-    ok: response.ok,
-    json,
-    text,
-    contentType: response.headers.get("content-type") || "",
-    cfRay: response.headers.get("cf-ray"),
-    retryAfter: response.headers.get("retry-after"),
-  };
+  // Kein unauthentifizierter REST-Call auf /gateway: genau das löst auf
+  // geteilten Hosting-IPs Cloudflare 1015 aus und verlängert die Sperre.
+  log(`[diagnose] REST-Hosts: ${discordNet.bases.join(", ")}. /gateway wird nicht unauthentifiziert angefragt.`);
 }
 
 /** Baut aus einer Nicht-JSON-Antwort (HTML/Cloudflare) eine kurze, aussagekräftige Log-Zeile. */
 function describeHttpProblem(result) {
-  const cloudflareCode = /error code:?\s*(\d{3,4})/i.exec(result.text)?.[1]
-    || /Cloudflare Ray ID.*?\b(1\d{3})\b/i.exec(result.text)?.[1];
-  const title = /<title[^>]*>([^<]{0,120})<\/title>/i.exec(result.text)?.[1]?.trim();
-  const parts = [`HTTP ${result.status}`, `content-type=${result.contentType || "?"}`];
+  const text = result?.text || "";
+  const jsonTitle = result?.json?.title;
+  const cloudflareCode = /error code:?\s*(\d{3,4})/i.exec(text)?.[1]
+    || /Cloudflare Ray ID.*?\b(1\d{3})\b/i.exec(text)?.[1]
+    || (/1015/.test(jsonTitle || text) ? "1015" : null);
+  const title = jsonTitle || /<title[^>]*>([^<]{0,120})<\/title>/i.exec(text)?.[1]?.trim();
+  const parts = [`HTTP ${result?.status ?? "?"}`, `content-type=${result?.contentType || "?"}`];
   if (title) parts.push(`title="${title}"`);
   if (cloudflareCode) parts.push(`cloudflare-error=${cloudflareCode}`);
-  if (result.cfRay) parts.push(`cf-ray=${result.cfRay}`);
-  if (result.retryAfter) parts.push(`retry-after=${result.retryAfter}`);
-  if (!title && !cloudflareCode) parts.push(`body="${redactSecrets(result.text.slice(0, 160).replace(/\s+/g, " "))}"`);
+  if (result?.cfRay) parts.push(`cf-ray=${result.cfRay}`);
+  if (result?.retryAfter) parts.push(`retry-after=${result.retryAfter}`);
+  if (!title && !cloudflareCode && text) parts.push(`body="${redactSecrets(text.slice(0, 160).replace(/\s+/g, " "))}"`);
   return parts.join(", ");
 }
 
 /**
- * Prüft vor dem Gateway-Login mit dem echten Token, ob die Discord-API überhaupt
- * erreichbar ist und ob der Token gültig ist. Ohne diese Prüfung hängt
- * discord.js beim internen Abruf von /gateway/bot bis ins Login-Timeout, ohne je
- * zu verraten, warum (genau das Muster aus den Render-Logs).
+ * Prüft vor dem Gateway-Login den Token über REST (mit Host-Failover).
+ * Ein Cloudflare-1015 ist KEIN Grund, den Login zu überspringen: der
+ * WebSocket zu gateway.discord.gg bleibt in der Regel erreichbar.
  *
- * @returns {Promise<{ok: boolean, fatal: boolean, reason: string|null}>}
+ * @returns {Promise<{ok: boolean, fatal: boolean, restOk: boolean, reason: string|null}>}
  */
 async function preflightDiscordAuth() {
-  let result;
-  try {
-    result = await discordApi("/gateway/bot", { authorized: true, timeoutMs: config.restTimeoutMs });
-  } catch (error) {
-    reportError("[preflight] /gateway/bot nicht erreichbar", error);
-    return { ok: false, fatal: false, reason: `Netzwerkfehler: ${error?.message || error}` };
+  if (discordNet.availableBaseCount() === 0) {
+    const waitS = Math.round(discordNet.msUntilAnyHost() / 1000);
+    log(`[preflight] REST-Hosts noch im Cloudflare-Cooldown (nächster in ${waitS} s). Gateway-Login ohne REST.`);
+    return { ok: true, fatal: false, restOk: false, reason: `REST-Cooldown ${waitS}s, Gateway-Fallback.` };
   }
+
+  const result = await discordNet.probe("/gateway/bot", {
+    authorized: true,
+    token: config.token,
+    timeoutMs: config.restTimeoutMs,
+    headers: { "user-agent": DISCORD_USER_AGENT },
+  });
 
   if (result.ok && result.json?.url) {
     const limit = result.json.session_start_limit;
-    log(`[preflight] Token akzeptiert. Gateway ${redactSecrets(result.json.url)}, empfohlene Shards: ${result.json.shards}${limit ? `, Session-Starts übrig: ${limit.remaining}/${limit.total} (Reset in ${Math.round((limit.reset_after ?? 0) / 1000)} s)` : ""}.`);
+    log(`[preflight] Token akzeptiert über ${result.base}. Gateway ${redactSecrets(result.json.url)}, empfohlene Shards: ${result.json.shards}${limit ? `, Session-Starts übrig: ${limit.remaining}/${limit.total} (Reset in ${Math.round((limit.reset_after ?? 0) / 1000)} s)` : ""}.`);
     if (limit && limit.remaining <= 0) {
-      return { ok: false, fatal: false, reason: `Session-Start-Limit erschöpft, Reset in ${Math.round((limit.reset_after ?? 0) / 1000)} s.` };
+      return { ok: true, fatal: false, restOk: false, reason: `Session-Start-Limit erschöpft, Reset in ${Math.round((limit.reset_after ?? 0) / 1000)} s. Gateway-Fallback.` };
     }
-    return { ok: true, fatal: false, reason: null };
+    return { ok: true, fatal: false, restOk: true, reason: null };
   }
 
-  if (result.status === 401) {
+  if (result.status === 401 || result.fatal) {
     logError("[preflight] Discord lehnt den Token ab (HTTP 401 Unauthorized). Bitte im Developer Portal unter Bot → Reset Token einen neuen Token erzeugen und DISCORD_TOKEN in Render aktualisieren (ohne Präfix 'Bot ', ohne Anführungszeichen/Leerzeichen).");
-    return { ok: false, fatal: true, reason: "Ungültiger Bot-Token (HTTP 401)." };
+    return { ok: false, fatal: true, restOk: false, reason: "Ungültiger Bot-Token (HTTP 401)." };
   }
-  if (result.status === 403) {
-    logError(`[preflight] Discord antwortet mit HTTP 403: ${describeHttpProblem(result)}`);
-    return { ok: false, fatal: false, reason: "HTTP 403 von Discord." };
-  }
-  if (result.status === 429) {
-    const retryAfter = Number(result.json?.retry_after ?? result.retryAfter ?? 0);
-    logError(`[preflight] Rate Limit von Discord/Cloudflare: ${describeHttpProblem(result)}. Das trifft auf geteilten Hosting-IPs (z. B. Render Free) regelmäßig zu.`);
-    return { ok: false, fatal: false, reason: `Rate Limit, retry_after=${retryAfter}s.` };
-  }
-  logError(`[preflight] Unerwartete Antwort von /gateway/bot: ${describeHttpProblem(result)}`);
-  return { ok: false, fatal: false, reason: `Unerwartete Antwort (HTTP ${result.status}).` };
+
+  logError(`[preflight] Discord-REST nicht nutzbar (${result.reason || describeHttpProblem(result)}). Der Gateway-Login läuft trotzdem (wss://gateway.discord.gg).`);
+  return { ok: true, fatal: false, restOk: false, reason: result.reason || `REST HTTP ${result.status}` };
 }
 
 const botState = {
@@ -253,6 +218,7 @@ app.get("/health", (_request, response) => {
       lastError: botState.lastGatewayError,
       lastLoginError: botState.lastLoginError,
       lastPreflight: botState.lastPreflight,
+      rest: discordNet.snapshot(),
     },
     commands: botState.commandRegistration,
   });
@@ -480,14 +446,15 @@ let verboseLogin = false;
 function createClient() {
   const newClient = new Client({
     intents: [GatewayIntentBits.Guilds],
-    // Ohne diese Optionen nutzt discord.js 15 s Timeout und 3 Retries je REST-Anfrage.
-    // Beim internen Abruf von /gateway/bot summiert sich das lautlos auf ~60 s –
-    // exakt das Login-Timeout aus den Logs. Ein Versuch mit klarem Zeitlimit
-    // scheitert stattdessen schnell und sichtbar.
+    shards: [0],
+    shardCount: 1,
+    // Host-Failover + Gateway-Fallback sitzen in discordNet.makeRequest.
+    // rejectOnRateLimit verhindert, dass discord.js bei Cloudflare 1015 6 h blockiert.
     rest: {
       timeout: config.restTimeoutMs,
       retries: 1,
       userAgentAppendix: "RobloxAvatarRenderTest",
+      ...discordNet.restClientOptions(),
     },
   });
   const isCurrent = () => newClient === client;
@@ -599,27 +566,28 @@ async function connectWithRetries() {
       return false;
     }
 
-    if (preflight.ok) {
-      log(`[login] Versuch ${label}: Verbinde mit dem Discord-Gateway (Timeout: ${config.loginTimeoutMs / 1000} s) …`);
-      try {
-        await loginOnce();
-        verboseLogin = false;
-        botState.lastLoginError = null;
-        botState.nextRetryAt = null;
-        log(`[login] Login abgeschlossen nach ${((Date.now() - startedAt) / 1000).toFixed(1)} s (Versuch ${label}).`);
-        return true;
-      } catch (error) {
-        botState.lastLoginError = redactSecrets(error?.message || String(error));
-        reportError(`[login] Versuch ${label} fehlgeschlagen`, error);
-      }
-    } else {
-      botState.lastLoginError = preflight.reason;
-      logError(`[login] Versuch ${label} übersprungen: Discord-REST-API nicht nutzbar (${preflight.reason}).`);
+    const via = preflight.restOk ? "REST + Gateway" : "Gateway-Direktverbindung (REST blockiert/Cooldown)";
+    log(`[login] Versuch ${label}: Verbinde mit dem Discord-Gateway über ${via} (Timeout: ${config.loginTimeoutMs / 1000} s) …`);
+    try {
+      await loginOnce();
+      verboseLogin = false;
+      botState.lastLoginError = null;
+      botState.nextRetryAt = null;
+      log(`[login] Login abgeschlossen nach ${((Date.now() - startedAt) / 1000).toFixed(1)} s (Versuch ${label}${discordNet.gatewayFallback ? ", Gateway-Fallback" : ""}).`);
+      return true;
+    } catch (error) {
+      botState.lastLoginError = redactSecrets(error?.message || String(error));
+      reportError(`[login] Versuch ${label} fehlgeschlagen`, error);
     }
 
     if (!unlimited && attempt >= config.loginAttempts) break;
-    // Exponentielles Backoff mit Deckel, damit Rate Limits nicht endlos angefeuert werden.
-    const delay = Math.min(config.loginBackoffMs * 2 ** Math.min(attempt - 1, 10), config.loginBackoffMaxMs);
+    // REST-1015 nicht alle paar Sekunden nachfeuern: mind. Backoff, und wenn REST
+    // noch im Cooldown ist und der Gateway-Versuch scheiterte, etwas länger warten.
+    const restWait = discordNet.availableBaseCount() === 0 ? Math.min(discordNet.msUntilAnyHost(), 60_000) : 0;
+    const delay = Math.max(
+      Math.min(config.loginBackoffMs * 2 ** Math.min(attempt - 1, 10), config.loginBackoffMaxMs),
+      restWait,
+    );
     botState.status = "waiting";
     botState.nextRetryAt = new Date(Date.now() + delay).toISOString();
     log(`[login] Nächster Versuch in ${Math.round(delay / 1000)} s …`);
@@ -640,7 +608,13 @@ async function registerCommands() {
   log(`[commands] Registriere ${commands.length} Command(s) (${target}) über REST …`);
   const registrationStartedAt = Date.now();
   try {
-    const rest = new REST({ version: "10", timeout: config.restTimeoutMs, retries: 2 }).setToken(config.token);
+    const rest = new REST({
+      version: "10",
+      timeout: config.restTimeoutMs,
+      retries: 1,
+      userAgentAppendix: "RobloxAvatarRenderTest",
+      ...discordNet.restClientOptions(),
+    }).setToken(config.token);
     const route = guildScoped
       ? Routes.applicationGuildCommands(config.applicationId, config.guildId)
       : Routes.applicationCommands(config.applicationId);
@@ -688,12 +662,26 @@ async function startBot({ diagnose = true } = {}) {
       return;
     }
 
-    // 3) Danach Command-Registrierung per REST.
+    // 3) Danach Command-Registrierung per REST (mit Host-Failover). Bei 1015
+    //    bleibt der Bot online und die Registrierung wird im Hintergrund wiederholt.
     await registerCommands();
+    if (botState.commandRegistration.state !== "registered") {
+      void retryCommandRegistration();
+    }
   } finally {
     botRunning = false;
   }
 }
+
+async function retryCommandRegistration() {
+  for (let attempt = 1; attempt <= 30 && botState.commandRegistration.state !== "registered"; attempt += 1) {
+    const wait = Math.max(15_000, Math.min(discordNet.msUntilAnyHost() || 30_000, 15 * 60 * 1000));
+    log(`[commands] Erneuter Registrierungsversuch ${attempt} in ${Math.round(wait / 1000)} s …`);
+    await sleep(wait);
+    await registerCommands();
+  }
+}
+
 const server = app.listen(config.port, "0.0.0.0", () => {
   log(`[http] HTTP: Port ${config.port} (Healthcheck: /health).`);
   void startBot();
