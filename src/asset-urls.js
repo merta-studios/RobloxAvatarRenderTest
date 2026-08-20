@@ -52,10 +52,9 @@ const ASSET_ID_URL_PATTERN = /^\/v[12]\/asset$/;
  *   https://assetdelivery.roblox.com/v2/asset?id=123&…&contentRepresentationPriorityList=…
  *     → https://assetdelivery.roblox.com/v2/assetId/123/version/456
  *
- * Konservativ: Ist die Version unbekannt ODER enthält die URL eine
- * `contentRepresentationPriorityList` (Format-Aushandlung, die der versionierte
- * Endpunkt nicht zuverlässig unterstützt), bleibt die URL unverändert – der
- * unversionierte Endpunkt funktioniert für Katalog-Assets weiterhin.
+ * Ist die Version unbekannt, bleibt die URL unverändert – der unversionierte
+ * Endpunkt funktioniert für viele Katalog-Assets weiterhin. Query-Parameter
+ * (inkl. `contentRepresentationPriorityList` für Kopf-Formen) bleiben erhalten.
  *
  * @param {string} rawUrl Zu prüfende URL
  * @param {Map<string, string>} versionById Versions-Map (id → version)
@@ -74,7 +73,6 @@ export function rewriteAssetDeliveryUrl(rawUrl, versionById) {
 
   const assetId = url.searchParams.get("id");
   if (!assetId || !/^\d+$/.test(assetId)) return rawUrl;
-  if (url.searchParams.has("contentRepresentationPriorityList")) return rawUrl;
 
   const version = versionById.get(assetId);
   if (!version) return rawUrl;

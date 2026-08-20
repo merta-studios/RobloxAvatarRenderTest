@@ -122,5 +122,6 @@ test("probe erkennt HTTP 401 als fatal und versucht keine weiteren Hosts", async
 
 test("Dockerfile kopiert discord-net.js in das Runtime-Image", () => {
   const dockerfile = readFileSync(new URL("../Dockerfile", import.meta.url), "utf8");
-  assert.match(dockerfile, /discord-net\.js/);
+  // Gesamtes src/ (inkl. discord-net.js) – nicht mehr einzelne Dateien cherry-picken.
+  assert.match(dockerfile, /COPY src \.\/src/);
 });

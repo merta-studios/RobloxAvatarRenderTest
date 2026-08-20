@@ -7,6 +7,7 @@ import {
   RBXRenderer,
 } from "roavatar-renderer";
 
+import { BUILD_ID } from "./build-info.js";
 import { createAssetVersionMap, recordAssetVersions, rewriteAssetDeliveryUrl } from "./asset-urls.js";
 import "./renderer.css";
 
@@ -25,6 +26,7 @@ const state = window.__renderState = {
   done: false,
   error: null,
   assetLabels: [],
+  buildId: BUILD_ID,
   updatedAt: Date.now(),
 };
 
@@ -93,12 +95,30 @@ function fetchWithTimeout(input, init = {}) {
   });
 }
 
+/**
+ * roavatar-renderer setzt z. B. `Roblox-AssetFormat: avatar_meshpart_head`
+ * bzw. `avatar_meshpart_accessory`. Ohne diese Header liefert Asset-Delivery
+ * oft das falsche Format – der Proxy muss sie durchreichen.
+ */
+function pickProxyHeaders(headers) {
+  if (!headers) return {};
+  const src = headers instanceof Headers ? headers : new Headers(headers);
+  const out = {};
+  for (const name of ["roblox-assetformat", "roblox-place-id"]) {
+    const value = src.get(name);
+    if (value) out[name] = value;
+  }
+  return out;
+}
+
 const nativeFetchDirect = (input, init = {}) => {
   const raw = input instanceof Request ? input.url : String(input);
   if (/^https:\/\//i.test(raw)) {
+    const headerSource = input instanceof Request ? input.headers : init.headers;
     return fetchWithTimeout(`/roblox-proxy?url=${encodeURIComponent(rewriteAssetDeliveryUrl(raw, assetVersionById))}`, {
-      method: init.method || "GET",
+      method: init.method || (input instanceof Request ? input.method : "GET") || "GET",
       signal: init.signal,
+      headers: pickProxyHeaders(headerSource),
     });
   }
   return fetchWithTimeout(input, init);

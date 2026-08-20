@@ -23,7 +23,19 @@ test("public/draco_decoder.js definiert das globale DracoDecoderModule", () => {
 
 test("Dockerfile kopiert public/ in die Build-Stage, damit Vite draco_decoder.js in dist/ ablegt", () => {
   const dockerfile = readFileSync(new URL("Dockerfile", root), "utf8");
-  assert.match(dockerfile, /COPY public \.\/public\//);
+  assert.match(dockerfile, /COPY public \.\/public/);
+});
+
+test("Dockerfile kopiert das gesamte src/ – sonst scheitert vite build an asset-urls.js", () => {
+  const dockerfile = readFileSync(new URL("Dockerfile", root), "utf8");
+  // PR #8 hat nur renderer-client.js + renderer.css kopiert. Vite konnte
+  // ./asset-urls.js nicht auflösen, der Deploy blieb auf dem alten Image.
+  assert.match(dockerfile, /COPY src \.\/src/);
+  assert.doesNotMatch(dockerfile, /COPY src\/renderer-client\.js src\/renderer\.css/);
+  assert.doesNotMatch(
+    dockerfile,
+    /COPY src\/server\.js src\/config\.js src\/commands\.js src\/roblox\.js src\/discord-net\.js/,
+  );
 });
 
 test("Renderer nutzt lokale Bibliotheks-Assets statt der cookie-pflichtigen Online-Versionen", () => {
@@ -37,6 +49,9 @@ test("Renderer nutzt lokale Bibliotheks-Assets statt der cookie-pflichtigen Onli
   // Avatar-Assets laufen versioniert über assetdelivery (cookie-frei).
   assert.match(client, /rewriteAssetDeliveryUrl/);
   assert.match(client, /recordAssetVersions\(outfit, assetVersionById\)/);
+  // Roblox-AssetFormat muss durch den Proxy, sonst kommen Accessoires/Köpfe im falschen Format.
+  assert.match(client, /roblox-assetformat/);
+  assert.match(client, /BUILD_ID/);
 });
 
 test("alle statischen roavatar-Assets sind im Repo vorhanden", () => {
@@ -53,6 +68,15 @@ test("alle statischen roavatar-Assets sind im Repo vorhanden", () => {
   for (const file of required) {
     assert.ok(existsSync(new URL(file, root)), `fehlendes lokales Asset: ${file}`);
   }
+});
+
+test("Server legt Build-Kennung, Diagnose-Logs und SKIP_DISCORD offen", () => {
+  const server = readFileSync(new URL("src/server.js", root), "utf8");
+  assert.match(server, /build: getBuildInfo\(\)/);
+  assert.match(server, /config\.skipDiscord/);
+  assert.match(server, /logRenderFailure/);
+  assert.match(server, /\/render-debug/);
+  assert.match(server, /roblox-assetformat/);
 });
 
 test("Renderer löst die lokalen Rig-Pfade deterministisch auf", () => {
