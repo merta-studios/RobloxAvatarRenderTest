@@ -1,10 +1,12 @@
 import express from "express";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import util from "node:util";
 import puppeteer from "puppeteer-core";
 import {
   AttachmentBuilder,
   Client,
+  Events,
   EmbedBuilder,
   GatewayIntentBits,
   PermissionFlagsBits,
@@ -20,9 +22,76 @@ validateBotConfig();
 let busy = false;
 let activeJob = null;
 
+const log = (...args) => console.log(new Date().toISOString(), ...args);
+const logError = (...args) => console.error(new Date().toISOString(), ...args);
+
+function redactSecrets(value) {
+  if (typeof value !== "string" || !config.token) return value;
+  return value.split(config.token).join("[REDACTED]");
+}
+
+function describeError(error) {
+  const parts = [`name=${error?.name || "Error"}`, `message=${error?.message || "unbekannt"}`];
+  if (error?.code) parts.push(`code=${error.code}`);
+  if (error?.status) parts.push(`status=${error.status}`);
+  if (error?.method) parts.push(`method=${error.method}`);
+  if (error?.url) parts.push(`url=${redactSecrets(error.url)}`);
+  if (error?.retryAfter) parts.push(`retryAfter=${error.retryAfter}`);
+  if (error?.cause) {
+    parts.push(`cause=${redactSecrets(`${error.cause.name || "?"}: ${error.cause.message || ""}`).trim()}`);
+  }
+  return parts.join(", ");
+}
+
+function reportError(context, error) {
+  logError(`${context}: ${describeError(error)}`);
+  if (config.debug && error && typeof error === "object") {
+    logError(`${context} (Details):`, util.inspect(error, { depth: 4, colors: false }));
+  }
+}
+
+/** Wettlauf gegen ein hartes Zeitlimit; verhindert, dass ein Promise (z. B. REST oder Login) endlos hängt. */
+function withTimeout(promise, timeoutMs, label) {
+  let timer;
+  const timeout = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => {
+      reject(new Error(`${label}: Timeout nach ${Math.round(timeoutMs / 1000)} s überschritten.`));
+    }, timeoutMs);
+  });
+  Promise.resolve(promise).catch(() => {});
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+const botState = {
+  status: "offline", // offline | connecting | ready | reconnecting
+  readyAt: null,
+  userTag: null,
+  lastGatewayError: null,
+  commandRegistration: { state: "pending", startedAt: null, target: null, count: 0, durationMs: null, error: null },
+};
+
 const app = express();
 app.disable("x-powered-by");
-app.get("/health", (_request, response) => response.json({ ok: true, busy, job: activeJob }));
+app.get("/health", (_request, response) => {
+  const discordReady = client.isReady();
+  const healthy = discordReady || !config.healthRequireDiscord;
+  response.status(healthy ? 200 : 503).json({
+    ok: healthy,
+    busy,
+    job: activeJob,
+    uptime: Math.round(process.uptime()),
+    discord: {
+      ready: discordReady,
+      status: botState.status,
+      user: botState.userTag,
+      readyAt: botState.readyAt,
+      ping: client.ws?.ping ?? null,
+      gateway: client.ws?.gateway ?? null,
+      lastError: botState.lastGatewayError,
+    },
+    commands: botState.commandRegistration,
+  });
+});
 
 async function fetchAllowedRobloxUrl(initialUrl, signal) {
   let currentUrl = initialUrl;
@@ -224,7 +293,7 @@ async function handleRender(interaction) {
       );
     await interaction.editReply({ embeds: [doneEmbed], files: [attachment] });
   } catch (error) {
-    console.error("Render failed:", error);
+    reportError("[render] Render fehlgeschlagen", error);
     const friendly = error instanceof RobloxError ? error.message
       : error?.name === "TimeoutError" ? "Der Render hat das Zeitlimit überschritten."
       : `Render fehlgeschlagen: ${error?.message || "Unbekannter Fehler"}`;
@@ -240,32 +309,108 @@ async function handleRender(interaction) {
 }
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-client.once("ready", (readyClient) => console.log(`Discord: eingeloggt als ${readyClient.user.tag}`));
+
+client.on(Events.ClientReady, (readyClient) => {
+  botState.status = "ready";
+  botState.readyAt = new Date().toISOString();
+  botState.userTag = readyClient.user.tag;
+  log(`[gateway] Discord: eingeloggt als ${readyClient.user.tag} (ID ${readyClient.user.id}).`);
+  log(`[gateway] Endpunkt ${client.ws.gateway}, Shards ${client.ws.shards.size}, Ping ${client.ws.ping} ms, Guilds im Cache: ${client.guilds.cache.size}.`);
+});
+client.on(Events.ShardReconnecting, (shardId) => {
+  botState.status = "reconnecting";
+  log(`[gateway] Shard ${shardId}: Verbindung wird wiederhergestellt …`);
+});
+client.on(Events.ShardResume, (shardId, replayed) => {
+  botState.status = "ready";
+  log(`[gateway] Shard ${shardId}: Sitzung fortgesetzt (${replayed} Events erneut zugestellt).`);
+});
+client.on(Events.ShardDisconnect, (event, shardId) => {
+  botState.status = "reconnecting";
+  log(`[gateway] Shard ${shardId}: Verbindung getrennt (Code ${event.code}${event.reason ? `, Grund: ${event.reason}` : ""}).`);
+});
+client.on(Events.ShardError, (error, shardId) => {
+  botState.lastGatewayError = redactSecrets(error?.message || String(error));
+  reportError(`[gateway] Shard ${shardId}`, error);
+});
+client.on(Events.Warn, (info) => log(`[discord] Warnung: ${redactSecrets(info)}`));
+client.on(Events.Error, (error) => {
+  botState.lastGatewayError = redactSecrets(error?.message || String(error));
+  reportError("[discord]", error);
+});
+client.on(Events.Invalidated, () => {
+  botState.status = "offline";
+  logError("[gateway] Sitzung invalidiert (Token zurückgezogen?). Neustart erforderlich.");
+});
+if (config.debug) client.on(Events.Debug, (message) => log(`[debug] ${redactSecrets(message)}`));
+
 client.on("interactionCreate", (interaction) => {
   if (interaction.isChatInputCommand() && interaction.commandName === "render_avatar") void handleRender(interaction);
 });
 
-const server = app.listen(config.port, "0.0.0.0", async () => {
-  console.log(`HTTP: Port ${config.port}`);
+async function startBot() {
+  const startedAt = Date.now();
+  log(`[startup] Start (Node ${process.version}, PID ${process.pid}).`);
+  log(`[startup] App-ID ${config.applicationId}, Commands ${config.guildId ? `nur für Guild ${config.guildId}` : "global"}, REST-Timeout ${config.restTimeoutMs / 1000} s, Login-Timeout ${config.loginTimeoutMs / 1000} s, Healthcheck erfordert Discord: ${config.healthRequireDiscord ? "ja" : "nein"}, Debug-Logs ${config.debug ? "an" : "aus"}.`);
+
+  // 1) Gateway-Login zuerst: Erst wenn der Bot online ist, wird die Command-Registrierung versucht.
+  botState.status = "connecting";
+  log(`[login] Verbinde mit dem Discord-Gateway (Timeout: ${config.loginTimeoutMs / 1000} s) …`);
   try {
-    const rest = new REST({ version: "10" }).setToken(config.token);
-    const route = config.guildId
+    await withTimeout(client.login(config.token), config.loginTimeoutMs, "Discord-Login");
+  } catch (error) {
+    reportError("[login] Login fehlgeschlagen", error);
+    logError(`[login] Abbruch nach ${((Date.now() - startedAt) / 1000).toFixed(1)} s. Prozess wird beendet, damit die Plattform einen Neustart versuchen kann.`);
+    shutdownNow(1);
+    return;
+  }
+  log(`[login] Login abgeschlossen nach ${((Date.now() - startedAt) / 1000).toFixed(1)} s.`);
+
+  // 2) Danach Command-Registrierung per REST, mit Zeitlimits auf beiden Ebenen.
+  const guildScoped = Boolean(config.guildId);
+  const target = guildScoped ? `Guild ${config.guildId}` : "global";
+  botState.commandRegistration = { state: "registering", startedAt: new Date().toISOString(), target, count: 0, durationMs: null, error: null };
+  log(`[commands] Registriere ${commands.length} Command(s) (${target}) über REST …`);
+  const registrationStartedAt = Date.now();
+  try {
+    const rest = new REST({ version: "10", timeout: config.restTimeoutMs, retries: 2 }).setToken(config.token);
+    const route = guildScoped
       ? Routes.applicationGuildCommands(config.applicationId, config.guildId)
       : Routes.applicationCommands(config.applicationId);
-    await rest.put(route, { body: commands });
-    console.log(`Discord-Command registriert (${config.guildId ? "Test-Server" : "global"}).`);
-    await client.login(config.token);
+    // Gesamt-Deadline: bis zu 3 Versuche (1 + 2 Retries) à REST-Timeout, plus 5 s Puffer.
+    const deadline = config.restTimeoutMs * 3 + 5_000;
+    const registered = await withTimeout(rest.put(route, { body: commands }), deadline, "Command-Registrierung");
+    const list = Array.isArray(registered) ? registered : [registered];
+    const durationMs = Date.now() - registrationStartedAt;
+    botState.commandRegistration = { state: "registered", startedAt: botState.commandRegistration.startedAt, target, count: list.length, durationMs, error: null };
+    log(`[commands] ${list.length} Command(s) registriert (${target}) in ${(durationMs / 1000).toFixed(1)} s: ${list.map((command) => command.name).join(", ") || "–"}`);
   } catch (error) {
-    console.error("Bot-Start fehlgeschlagen:", error);
-    server.close(() => process.exit(1));
+    const durationMs = Date.now() - registrationStartedAt;
+    botState.commandRegistration = { state: "failed", startedAt: botState.commandRegistration.startedAt, target, count: 0, durationMs, error: redactSecrets(error?.message || String(error)) };
+    reportError(`[commands] Registrierung fehlgeschlagen nach ${(durationMs / 1000).toFixed(1)} s`, error);
+    logError("[commands] Der Bot bleibt online, der Slash-Command ist aber ggf. nicht verfügbar. Status: GET /health. (Die Anfrage läuft möglicherweise im Hintergrund weiter.)");
   }
+}
+
+const server = app.listen(config.port, "0.0.0.0", () => {
+  log(`[http] HTTP: Port ${config.port} (Healthcheck: /health).`);
+  void startBot();
 });
 
-async function shutdown(signal) {
-  console.log(`${signal}: fahre herunter …`);
+function shutdownNow(exitCode) {
   client.destroy();
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(1), 10_000).unref();
+  server.close(() => process.exit(exitCode));
+  setTimeout(() => process.exit(exitCode), 10_000).unref();
+}
+
+function shutdown(signal) {
+  log(`[shutdown] ${signal} empfangen – fahre herunter …`);
+  shutdownNow(0);
 }
 process.once("SIGTERM", () => shutdown("SIGTERM"));
 process.once("SIGINT", () => shutdown("SIGINT"));
+process.on("unhandledRejection", (reason) => logError("[process] Unbehandelte Promise-Ablehnung:", reason));
+process.on("uncaughtException", (error) => {
+  reportError("[process] Unbehandelter Fehler", error);
+  process.exit(1);
+});

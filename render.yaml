@@ -17,3 +17,11 @@ services:
         value: "420"
       - key: MAX_ASSET_MB
         value: "30"
+      - key: REST_TIMEOUT_SECONDS
+        value: "30"
+      - key: LOGIN_TIMEOUT_SECONDS
+        value: "60"
+      - key: HEALTH_REQUIRE_DISCORD
+        value: "true"
+      - key: DISCORD_DEBUG
+        value: "false"
