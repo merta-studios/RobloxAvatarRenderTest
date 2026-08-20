@@ -608,9 +608,23 @@ async function handleRender(interaction) {
     await interaction.editReply({ embeds: [doneEmbed], files: [attachment] });
   } catch (error) {
     reportError("[render] Render fehlgeschlagen", error);
-    const friendly = error instanceof RobloxError ? error.message
+    let friendly = error instanceof RobloxError ? error.message
       : error?.name === "TimeoutError" ? "Der Render hat das Zeitlimit überschritten."
       : (error?.message || "Unbekannter Fehler");
+    // Fix C: Diagnose in die Discord-Antwort statt nur in die Logs – Build-ID
+    // zeigt veraltete Deploys, requestfailed/console den konkreten Auslöser.
+    const diagnostics = error?.diagnostics;
+    if (diagnostics) {
+      const notes = [];
+      if (diagnostics.buildId) notes.push(`Build: \`${diagnostics.buildId}\``);
+      const failed = (diagnostics.failedRequests || []).filter(Boolean).slice(0, 3)
+        .map((entry) => String(entry).replace(/^https?:\/\//, "").slice(0, 110));
+      if (failed.length) notes.push(`Fehlgeschlagene Requests: ${failed.join(" | ")}`);
+      const consoleProblems = (diagnostics.consoleErrors || []).filter(Boolean).slice(0, 3)
+        .map((entry) => String(entry).slice(0, 150));
+      if (consoleProblems.length) notes.push(`Console: ${consoleProblems.join(" | ")}`);
+      if (notes.length) friendly += `\n\n**Diagnose:**\n${notes.join("\n")}`;
+    }
     await editChain;
     if (interaction.deferred || interaction.replied) {
       await interaction.editReply({ embeds: [new EmbedBuilder().setColor(0xed4245).setTitle("❌ Render fehlgeschlagen").setDescription(friendly)], files: [] }).catch(console.error);

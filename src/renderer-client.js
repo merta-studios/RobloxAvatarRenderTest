@@ -1,7 +1,9 @@
 import {
   API,
+  AnimatorWrapper,
   Authentication,
   FLAGS,
+  HumanoidDescriptionWrapper,
   Outfit,
   OutfitRenderer,
   RBXRenderer,
@@ -9,7 +11,9 @@ import {
 
 import { BUILD_ID } from "./build-info.js";
 import { createAssetVersionMap, recordAssetVersions, rewriteAssetDeliveryUrl } from "./asset-urls.js";
-import { extractAssetIdFromUrl, guardGetAssetBuffer, guardGetMesh } from "./asset-loader-guard.js";
+import { extractAssetIdFromUrl, guardGetAssetBuffer, guardGetMesh, guardGetRBX } from "./asset-loader-guard.js";
+import { patchAnimatorWrapper, patchHumanoidDescriptionApply } from "./library-guards.js";
+import { withStallDeadline } from "./render-deadline.js";
 import { createFetchWithTimeout } from "./fetch-timeout.js";
 import "./renderer.css";
 
@@ -25,6 +29,15 @@ const WATCHDOG_TICK_MS = 5_000;
 // natürlichen Request-Limit (2 Versuche à 60 s = 120 s) und dem Watchdog (240 s),
 // damit ein hängendes Asset den Render nie mehr blockieren kann.
 const ASSET_LOAD_DEADLINE_MS = 150_000;
+// GetRBX = Download (max. ASSET_LOAD_DEADLINE_MS) + RBXM-Parsing: etwas mehr
+// Luft, dann wird das Asset übersprungen statt den Render zu blockieren.
+const GET_RBX_DEADLINE_MS = 190_000;
+// prepareForThumbnail darf beliebig lange laufen, SOLANGE noch Fortschritt zu
+// sehen ist (Labels bewegen sich). Stillstand wird nach 200 s abgebrochen –
+// unter dem 240-s-Watchdog, damit die konkrete Meldung gewinnt. Flache Grenze
+// knapp unter dem globalen Render-Timeout (420 s).
+const PREPARE_STALL_LIMIT_MS = 200_000;
+const PREPARE_FLAT_LIMIT_MS = 400_000;
 
 const state = window.__renderState = {
   phase: "idle",
@@ -174,6 +187,36 @@ API.Asset.GetAssetBuffer = guardGetAssetBuffer(getAssetBufferOriginal, {
 });
 const getMeshOriginal = API.Asset.GetMesh.bind(API.Asset);
 API.Asset.GetMesh = guardGetMesh(getMeshOriginal, { onSkipped: recordSkipped });
+// GetRBX deckt den zweiten internen Download-Pfad ab (RBXM-Bäume: Rig, Body
+// Parts, Animationen, Accessoires). Rejections – z. B. wirft rbx.fromBuffer()
+// auf korrupten/neuen Formaten – würden sonst an den .then(resolve)-Ketten der
+// Bibliothek hängen (Stillstand mit leerer Label-Liste).
+const getRbxOriginal = API.Asset.GetRBX.bind(API.Asset);
+API.Asset.GetRBX = guardGetRBX(getRbxOriginal, {
+  deadlineMs: GET_RBX_DEADLINE_MS,
+  onSkipped: recordSkipped,
+});
+
+/**
+ * Entschärft die Animation-Ladepfade der Bibliothek („Animation was already
+ * loaded“-Wettlauf, Prop()-Zugriffe auf leere RBX-Bäume, fehlende Parents):
+ * Diese Throws ließen _applyAnimations/loadAvatarAnimation über .then(resolve)-
+ * Promises OHNE catch NIE auflösen – der Render hing still in Phase „assets“.
+ * Gepatcht wird der Prototype der exportierten Klassen (kein node_modules-Eingriff).
+ */
+const recordSkippedAnimation = ({ method, id, error }) => {
+  const idStr = String(id ?? "");
+  if (/^\d+$/.test(idStr)) skippedAssetIds.add(idStr);
+  console.warn(`[guard] Animation übersprungen (${method}${idStr ? `, Asset ${idStr}` : ""}): ${error?.message || error}`);
+};
+patchAnimatorWrapper(AnimatorWrapper, { onSkipped: recordSkippedAnimation });
+patchHumanoidDescriptionApply(HumanoidDescriptionWrapper, {
+  onSkipped: ({ error }) => {
+    // Kein stiller Hänger mehr: _updateOutfit feuert stattdessen
+    // onError("humanoidDescription") → konkrete Fehlermeldung statt Watchdog.
+    console.warn(`[guard] applyDescription übersprungen: ${error?.message || error}`);
+  },
+});
 
 /**
  * Die Rig-URLs (`roavatar://RigR15.rbxm` / `RigR6`) löst die Bibliothek über
@@ -291,7 +334,16 @@ async function render(userId) {
   outfitRenderer.onRenderError.Connect(() => {
     assetFailure = assetFailure || "renderDesc";
   });
-  const succeeded = await outfitRenderer.prepareForThumbnail();
+  const succeeded = await withStallDeadline(outfitRenderer.prepareForThumbnail(), {
+    stallMs: PREPARE_STALL_LIMIT_MS,
+    flatMs: PREPARE_FLAT_LIMIT_MS,
+    getProgressSignature: () => `${state.phase}|${currentLabels().join("|")}`,
+    buildError: ({ reason, stalledMs, signature }) => new Error(
+      reason === "stall"
+        ? `Avatar-Zusammenbau hat ${Math.round(stalledMs / 1000)} s lang keinen Fortschritt gemacht (Phase „${state.phase}“${signature ? `, letztes Signal: ${signature.slice(0, 96)}` : ", keine Assets in Bearbeitung"}). Vermutlich hängt ein interner Bibliotheks-Pfad – Details stehen in den Server-Logs.`
+        : `Avatar-Zusammenbau hat das Zeitlimit von ${Math.round(PREPARE_FLAT_LIMIT_MS / 1000)} s überschritten (Phase „${state.phase}“).`,
+    ),
+  });
   if (!succeeded) {
     const detail = assetFailure
       ? `Fehlerstufe: ${assetFailure} – ${describeAssetFailure(assetFailure)}`

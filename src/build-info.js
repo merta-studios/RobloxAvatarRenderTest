@@ -5,7 +5,7 @@
  * RENDER_GIT_COMMIT setzt Render zur Laufzeit; GIT_COMMIT kann als Docker-ARG
  * eingebrannt werden. Ohne beides bleibt "unknown" – dann gilt `id`.
  */
-export const BUILD_ID = "docker-src-copy-2026-08-20";
+export const BUILD_ID = "getrbx-animator-stallguard-2026-08-20";
 
 export function getBuildInfo() {
   return {

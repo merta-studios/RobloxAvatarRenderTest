@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { extractAssetIdFromUrl, guardGetAssetBuffer, guardGetMesh } from "../src/asset-loader-guard.js";
+import { extractAssetIdFromUrl, guardGetAssetBuffer, guardGetMesh, guardGetRBX } from "../src/asset-loader-guard.js";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -82,4 +82,37 @@ test("GetMesh-Guard lässt echte Mesh-Ergebnisse unverändert", async () => {
   const mesh = { numverts: 4 };
   const guarded = guardGetMesh(async () => mesh);
   assert.equal(await guarded("rbxassetid://1"), mesh);
+});
+
+test("GetRBX-Guard fängt Rejections ab (rbx.fromBuffer wirft auf korruptem RBXM)", async () => {
+  const skipped = [];
+  const guarded = guardGetRBX(
+    async () => { throw new Error("Unknown chunk in RBXM"); },
+    { onSkipped: (url) => skipped.push(url) },
+  );
+  // Ohne Guard würde diese Rejection an den .then(resolve)-Ketten der
+  // Bibliothek hängen (Stillstand mit leerer Label-Liste).
+  assert.equal(await guarded("rbxassetid://507766388"), undefined);
+  assert.deepEqual(skipped, ["rbxassetid://507766388"]);
+});
+
+test("GetRBX-Guard beendet hängende RBX-Loads per Deadline statt ewig zu warten", async () => {
+  const skipped = [];
+  const guarded = guardGetRBX(
+    () => new Promise(() => {}),
+    { deadlineMs: 20, onSkipped: (url) => skipped.push(url) },
+  );
+  const startedAt = Date.now();
+  assert.equal(await guarded("rbxassetid://507766388"), undefined);
+  assert.ok(Date.now() - startedAt < 500, "Deadline muss deutlich unter dem Watchdog liegen");
+  assert.deepEqual(skipped, ["rbxassetid://507766388"]);
+});
+
+test("GetRBX-Guard lässt RBX-Instanzen und Response-Fehler unverändert durch", async () => {
+  const rbxTree = { chunks: 3 };
+  const guarded = guardGetRBX(async () => rbxTree);
+  assert.equal(await guarded("roavatar://RigR15.rbxm"), rbxTree);
+  const failed = new Response("Authentication required", { status: 401 });
+  const guardedResponse = guardGetRBX(async () => failed);
+  assert.equal(await guardedResponse("rbxassetid://13576957688"), failed);
 });
