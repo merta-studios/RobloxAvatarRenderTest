@@ -198,6 +198,7 @@ Der produktive Server liest `.env` nicht automatisch. Lokal die Werte in der She
 
 Der Fehler kommt mit Zusatzinfo, z. B. `… (letzte Phase: „assets“, zuletzt: „Originale Roblox-Assets und Meshes werden geladen …“)`. So liest man das:
 
+- **`unbekannt`** – Der Renderer-Code ist nie angelaufen (es wurde keine Phase gemeldet). Klassischer Grund war ein fehlendes `draco_decoder.js`: `roavatar-renderer` erwartet das globale `DracoDecoderModule` aus diesem klassischen Script, das VOR dem gebündelten Modul geladen werden muss (liegt unter `public/`, wird von Vite nach `dist/` kopiert und in `index.html` eingebunden). Der Bot meldet hier inzwischen den konkreten Seitenfehler (`Der Renderer konnte nicht initialisiert werden: …`); in den Render-Logs steht zusätzlich `Renderer page error`.
 - **`browser`** – Chromium selbst ist nicht gestartet. Render-Logs prüfen (`[render]`), meist Speicher-Problem beim Start.
 - **`setup`** – WebGL2-Kontext konnte nicht erstellt werden. Sehr unwahrscheinlich mit SwiftShader; Render-Logs prüfen.
 - **`profile`** – `avatar.roblox.com` nicht erreichbar oder der User blockiert die Avatar-Auskunft.
