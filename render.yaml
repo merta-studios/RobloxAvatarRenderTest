@@ -18,16 +18,18 @@ services:
       - key: MAX_ASSET_MB
         value: "30"
       - key: REST_TIMEOUT_SECONDS
-        value: "30"
+        value: "20"
       - key: LOGIN_TIMEOUT_SECONDS
-        value: "60"
+        value: "90"
       - key: LOGIN_ATTEMPTS
-        value: "3"
+        value: "0"
       - key: LOGIN_BACKOFF_SECONDS
         value: "5"
+      - key: LOGIN_BACKOFF_MAX_SECONDS
+        value: "300"
       - key: DNS_RESULT_ORDER
         value: ipv4first
       - key: HEALTH_REQUIRE_DISCORD
-        value: "true"
+        value: "false"
       - key: DISCORD_DEBUG
         value: "false"
