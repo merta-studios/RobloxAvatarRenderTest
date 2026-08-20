@@ -9,6 +9,8 @@ import {
 
 import { BUILD_ID } from "./build-info.js";
 import { createAssetVersionMap, recordAssetVersions, rewriteAssetDeliveryUrl } from "./asset-urls.js";
+import { extractAssetIdFromUrl, guardGetAssetBuffer, guardGetMesh } from "./asset-loader-guard.js";
+import { createFetchWithTimeout } from "./fetch-timeout.js";
 import "./renderer.css";
 
 /**
@@ -19,6 +21,10 @@ import "./renderer.css";
 const REQUEST_TIMEOUT_MS = 60_000;
 const STALL_LIMIT_MS = 240_000;
 const WATCHDOG_TICK_MS = 5_000;
+// Pro-Asset-Deadline für den GetAssetBuffer-Guard: liegt bewusst zwischen dem
+// natürlichen Request-Limit (2 Versuche à 60 s = 120 s) und dem Watchdog (240 s),
+// damit ein hängendes Asset den Render nie mehr blockieren kann.
+const ASSET_LOAD_DEADLINE_MS = 150_000;
 
 const state = window.__renderState = {
   phase: "idle",
@@ -26,9 +32,15 @@ const state = window.__renderState = {
   done: false,
   error: null,
   assetLabels: [],
+  // Assets, die nicht geladen werden konnten und deshalb übersprungen wurden
+  // (z. B. UGC mit HTTP 401 – Roblox verlangt dafür seit April 2025 Authentifizierung).
+  skippedAssets: [],
   buildId: BUILD_ID,
   updatedAt: Date.now(),
 };
+
+/** Asset-IDs, die übersprungen wurden (Fehlschlag oder Zeitlimit). */
+const skippedAssetIds = new Set();
 
 function report(phase, message) {
   Object.assign(state, { phase, message, updatedAt: Date.now() });
@@ -38,7 +50,14 @@ function report(phase, message) {
 
 function currentLabels() {
   try {
-    return API.Misc.getCurrentlyLoadingLabels().map((label) => String(label).slice(-96));
+    // Bereits übersprungene Assets ausblenden: Deren interne Labels bleiben in
+    // der Bibliothek hängen (sie räumt sie bei Fehlern nicht ab) und würden den
+    // Watchdog sonst fälschlich auf „kein Fortschritt“ schlagen lassen.
+    // Erst filtern, DANN kürzen – sonst geht bei langen Labels (z. B. mit
+    // contentRepresentationPriorityList) das rbxassetid://-Präfix verloren.
+    return API.Misc.getCurrentlyLoadingLabels()
+      .filter((label) => !skippedAssetIds.has(extractAssetIdFromUrl(label)))
+      .map((label) => String(label).slice(-96));
   } catch {
     return [];
   }
@@ -84,16 +103,8 @@ const nativeFetch = window.fetch.bind(window);
  */
 const assetVersionById = createAssetVersionMap();
 
-/** fetch mit hartem Zeitlimit — roavatar-renderer setzt selbst keins. */
-function fetchWithTimeout(input, init = {}) {
-  const signals = [];
-  if (init.signal) signals.push(init.signal);
-  signals.push(AbortSignal.timeout(REQUEST_TIMEOUT_MS));
-  return nativeFetch(input, {
-    ...init,
-    signal: signals.length > 1 ? AbortSignal.any(signals) : signals[0],
-  });
-}
+/** fetch mit hartem Zeitlimit auf die Antwort-Header — roavatar-renderer setzt selbst keins. */
+const fetchWithTimeout = createFetchWithTimeout(nativeFetch, { timeoutMs: REQUEST_TIMEOUT_MS });
 
 /**
  * roavatar-renderer setzt z. B. `Roblox-AssetFormat: avatar_meshpart_head`
@@ -143,6 +154,26 @@ FLAGS.ENABLE_API_RBX_CACHE = false;
 FLAGS.AUDIO_ENABLED = false;
 FLAGS.GEAR_ENABLED = false;
 FLAGS.API_REQUEST_RETRY = true;
+
+/**
+ * Härtet die Asset-Loader der Bibliothek ab: Ein einzelnes nicht ladbares Asset
+ * (z. B. UGC, das seit April 2025 ohne Authentifizierung HTTP 401 liefert) darf
+ * den Render weder blockieren noch abbrechen – es wird übersprungen und der
+ * Rest des Avatars gerendert. Fehlgeschlagene Assets landen in
+ * `state.skippedAssets` für die Discord-Antwort.
+ */
+const recordSkipped = (url) => {
+  const id = extractAssetIdFromUrl(url);
+  if (id) skippedAssetIds.add(id);
+  else skippedAssetIds.add(String(url).slice(0, 96));
+};
+const getAssetBufferOriginal = API.Asset.GetAssetBuffer.bind(API.Asset);
+API.Asset.GetAssetBuffer = guardGetAssetBuffer(getAssetBufferOriginal, {
+  deadlineMs: ASSET_LOAD_DEADLINE_MS,
+  onSkipped: recordSkipped,
+});
+const getMeshOriginal = API.Asset.GetMesh.bind(API.Asset);
+API.Asset.GetMesh = guardGetMesh(getMeshOriginal, { onSkipped: recordSkipped });
 
 /**
  * Die Rig-URLs (`roavatar://RigR15.rbxm` / `RigR6`) löst die Bibliothek über
@@ -279,6 +310,7 @@ async function render(userId) {
     }));
   });
   report("done", "Render fertig.");
+  state.skippedAssets = [...skippedAssetIds];
   state.done = true;
 }
 
@@ -291,6 +323,7 @@ if (!Number.isSafeInteger(userId) || userId <= 0) {
   render(userId).catch((error) => {
     console.error(error);
     state.error = error instanceof Error ? error.message : String(error);
+    state.skippedAssets = [...skippedAssetIds];
     state.done = true;
     report("error", state.error);
   });

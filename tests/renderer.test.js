@@ -88,3 +88,36 @@ test("Renderer löst die lokalen Rig-Pfade deterministisch auf", () => {
   // Lokale Texturen (Standard-Gesicht, Partikel) dürfen nicht am Proxy-HTTPS-Check scheitern.
   assert.match(client, /const remote = \/\^https:\\\/\\\//);
 });
+
+test("Renderer hängt nicht mehr an einzelnen Assets: Guard, Deadline und Skip-Reporting", () => {
+  const client = readFileSync(new URL("src/renderer-client.js", root), "utf8");
+  // GetAssetBuffer wird mit Rejection-/Deadline-Guard umhüllt (früher: Promise
+  // ohne catch → Render hing ewig in Phase „assets“).
+  assert.match(client, /guardGetAssetBuffer/);
+  assert.match(client, /ASSET_LOAD_DEADLINE_MS = 150_000/);
+  assert.match(client, /API\.Asset\.GetAssetBuffer = guardGetAssetBuffer/);
+  // Abgebrochene/failed Responses werden übersprungen statt den Render abzubrechen.
+  assert.match(client, /skippedAssetIds/);
+  assert.match(client, /state\.skippedAssets = \[\.\.\.skippedAssetIds\]/);
+  // Der Watchdog ignoriert Labels bereits übersprungener Assets (die Bibliothek
+  // räumt ihr Loading-Label bei Fehlern nicht ab).
+  assert.match(client, /getCurrentlyLoadingLabels/);
+  assert.match(client, /filter\(\(label\) => !skippedAssetIds\.has/);
+});
+
+test("fetchWithTimeout bricht nur die Header-Phase ab, nicht den Body-Stream", () => {
+  const moduleSource = readFileSync(new URL("src/fetch-timeout.js", root), "utf8");
+  assert.match(moduleSource, /AbortController/);
+  // Der Timer wird beim Settlen gelöscht: große/langsame Bodies werden nicht
+  // mehr nach 60 s mitten im Download abgebrochen.
+  assert.match(moduleSource, /\.finally\(\(\) => clearTimeout\(timeout\)\)/);
+  assert.doesNotMatch(moduleSource, /AbortSignal\.timeout/);
+});
+
+test("Server-Proxy kennt den OpenCloud-Fallback für assetdelivery-401s", () => {
+  const server = readFileSync(new URL("src/server.js", root), "utf8");
+  assert.match(server, /openCloudAssetDeliveryUrl/);
+  assert.match(server, /x-api-key/);
+  assert.match(server, /config\.openCloudApiKey/);
+  assert.match(server, /skippedAssets/);
+});

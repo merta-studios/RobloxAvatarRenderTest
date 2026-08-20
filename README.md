@@ -88,7 +88,8 @@ Die Konfiguration ist auf den kleinen Testtarif ausgerichtet:
 - 640×640, Device Scale 1, kein Post Processing und kein Hidden Surface Removal.
 - Layered-Clothing-Worker sind deaktiviert, damit keine Parallel-Last entsteht.
 - **Kein permanenter WebGL-Renderloop:** WebGL läuft in der Cloud über SwiftShader (reines Software-Rendering). Ein fortlaufender `requestAnimationFrame`-Loop würde auf 0,1 CPU den kompletten Browser-Thread blockieren, sodass Downloads und Mesh-Parsing verhungern und jeder Render ins Zeitlimit läuft. Der Renderer zeichnet deshalb genau **einen finalen Frame**, nachdem alle Assets kompiliert sind.
-- **Harte Zeitlimits pro Anfrage:** Jeder Asset-Download im Renderer hat ein 60-Sekunden-Limit (über den Proxy). Ein einzelner hängender Request blockiert nie den ganzen Render.
+- **Harte Zeitlimits pro Anfrage:** Jeder Asset-Download im Renderer bekommt ein 60-Sekunden-Limit bis zu den Antwort-Headern (über den Proxy). Große, langsam eintreffende Bodies werden dadurch nicht mehr mitten im Download abgebrochen; zusätzlich beendet eine Pro-Asset-Deadline (150 s) jedes einzelne Asset-Laden hart.
+- **Überspringen statt Hängen:** Ein nicht ladbares Asset (z. B. UGC mit HTTP 401 – Roblox verlangt dafür seit April 2025 Authentifizierung) blockiert den Render nicht mehr und bricht ihn auch nicht ab: Es wird übersprungen, der Rest des Avatars wird gerendert, und die Discord-Antwort nennt die übersprungenen Assets (`⚠️ N Asset(s) übersprungen`).
 - **Fortschritts-Watchdog:** Bleibt der Render 240 s ohne jede Bewegung in einer Phase hängen, bricht er mit einer konkreten Fehlermeldung ab (Phase + zuletzt geladenes Asset) statt 420 s lang still zu warten.
 - **Phasen-Logs:** Jede Render-Phase wird mit Laufzeit in den Server-Logs protokolliert (`[render] userId=… Phase assets – … (+42 s)`). Bei einem Timeout nennt die Discord-Antwort die letzte Phase.
 - Node-Heap ist im Container auf 160 MB begrenzt.
@@ -119,6 +120,7 @@ Siehe `.env.example`.
 | `DNS_RESULT_ORDER` | nein | `ipv4first` | DNS-Reihenfolge: `ipv4first` (Standard) behebt Verbindungs-Hänger in Containern ohne IPv6-Route; `verbatim` nutzt die System-Reihenfolge |
 | `HEALTH_REQUIRE_DISCORD` | nein | `false` | Wenn `true`, antwortet `/health` mit 503, solange der Bot nicht mit Discord verbunden ist |
 | `DISCORD_DEBUG` | nein | `false` | Ausführliche Debug-Logs von discord.js (REST/WebSocket) |
+| `ROBLOX_OPENCLOUD_API_KEY` | nein | – | OpenCloud-API-Key (erstellen unter <https://create.roblox.com/dashboard/credentials>, „legacy-asset:manage“ ist nicht nötig – ein Key eines beliebigen Users reicht für öffentliche Assets). Ohne Key werden UGC-Assets, die Roblox unauthentifiziert nicht mehr ausliefert (HTTP 401), übersprungen; mit Key lädt der Proxy sie über `apis.roblox.com/asset-delivery-api` nach. Kein Roblox-Cookie! |
 
 ## Startreihenfolge, Timeouts und Diagnose
 
@@ -225,7 +227,8 @@ Der Fehler kommt mit Zusatzinfo, z. B. `… (letzte Phase: „assets“, zuletzt
 - **`browser`** – Chromium selbst ist nicht gestartet. Render-Logs prüfen (`[render]`), meist Speicher-Problem beim Start.
 - **`setup`** – WebGL2-Kontext konnte nicht erstellt werden. Sehr unwahrscheinlich mit SwiftShader; Render-Logs prüfen.
 - **`profile`** – `avatar.roblox.com` nicht erreichbar oder der User blockiert die Avatar-Auskunft.
-- **`assets`** – Ein Asset-Download hängt oder scheitert (Roblox-Rate-Limit, moderiert/gelöscht, zu groß). In den Logs steht dank Fortschritts-Watchdog nach 240 s das konkrete Asset: `Kein Fortschritt … (zuletzt geladen: getAssetBufferInternal-rbxassetid://123…)`. Die Fehlermeldung `Mindestens ein Avatar-Asset konnte nicht verarbeitet werden.` nennt seit dem Fix zusätzlich die Fehlerstufe (`rig` = lokale Renderer-Assets fehlen, `humanoidDescription` = ein getragenes Asset scheitert, `renderDesc` = ein Mesh kompiliert nicht).
+- **`assets`** – Ein Asset-Download hängt oder scheitert (Roblox-Rate-Limit, moderiert/gelöscht, zu groß, **UGC ohne Authentifizierung**). Der Renderer überspringt einzelne fehlgeschlagene Assets inzwischen und rendert den Rest weiter (Hinweis in der Discord-Antwort); die Fehlermeldung `Mindestens ein Avatar-Asset konnte nicht verarbeitet werden.` (Fehlerstufe `rig`/`humanoidDescription`/`renderDesc`) bleibt nur für Fehler, die den Avatar selbst betreffen. Der Fortschritts-Watchdog (240 s) und die Pro-Asset-Deadline (150 s) sorgen dafür, dass die alte „Kein Fortschritt … (zuletzt geladen: getAssetBufferInternal-rbxassetid://123…)“-Hänger nicht mehr auftreten.
+- **UGC-Assets mit HTTP 401** – Seit April 2025 verlangt Roblox für Asset-Delivery-Endpunkte Authentifizierung; klassische Shirts/Pants und neuere Accessoires (UGC) liefern unauthentifiziert `401 Authentication required to access Asset.` (nur offizielle Roblox-Assets wie Body Parts, Dynamic Heads und Roblox-eigene Accessoires sind noch ausgenommen). Ohne Key werden diese Assets übersprungen (Avatar rendert trotzdem). Für vollständige Renders `ROBLOX_OPENCLOUD_API_KEY` setzen (siehe unten) – der Proxy lädt die Assets dann über die offizielle OpenCloud Asset-Delivery-API (`apis.roblox.com/asset-delivery-api`) nach.
 - **`finalize`** – Szene war fertig, aber das finale Bild konnte nicht gezeichnet werden (Speicher).
 
 Alle Phasen werden mit Laufzeit geloggt (`[render] userId=… Phase … (+42 s)`), sodass man in den Render-Logs genau sieht, wo die Zeit hingeht. Ergänzend kann es die Fehlermeldung `Chromium ist während des Renders abgestürzt` geben — das ist praktisch immer das Speicherlimit des freien Tarifs.
@@ -233,7 +236,8 @@ Alle Phasen werden mit Laufzeit geloggt (`[render] userId=… Phase … (+42 s)`
 ## Verhalten und Grenzen
 
 - Der Command erwartet den eindeutigen Roblox-**Username**, nicht den Display Name.
-- Private/moderierte/gelöschte Assets oder temporäre Roblox-Rate-Limits können einen Render verhindern.
+- Private/moderierte/gelöschte Assets oder temporäre Roblox-Rate-Limits können einzelne Teile des Avatars ausfallen lassen (sie werden übersprungen und in der Discord-Antwort genannt).
+- Seit April 2025 liefert Roblox UGC-Assets (Kleidung, neuere Accessoires) unauthentifiziert nicht mehr aus (HTTP 401). Ohne `ROBLOX_OPENCLOUD_API_KEY` fehlen diese Teile im Render, mit Key werden sie über die OpenCloud Asset-Delivery-API nachgeladen.
 - Roblox kann seine Legacy-Web-APIs ohne Vorankündigung ändern.
 - Einige besonders neue Dynamic Heads, Partikel oder Layered-Clothing-Kombinationen können vom Open-Source-Renderer noch nicht perfekt dargestellt werden.
 - Der Lock gilt für genau eine laufende Service-Instanz.

@@ -38,3 +38,34 @@ export function isAllowedRobloxAssetUrl(rawUrl) {
   if (url.protocol !== "https:") return false;
   return allowedHosts.has(url.hostname) || url.hostname === "rbxcdn.com" || url.hostname.endsWith(".rbxcdn.com");
 }
+
+/**
+ * Leitet eine assetdelivery.roblox.com-URL auf die offizielle OpenCloud
+ * Asset-Delivery-API um (https://apis.roblox.com/asset-delivery-api/v1/…).
+ * Die OpenCloud-Endpunkte sind seit April 2025 der einzige Weg, UGC-Assets
+ * (Kleidung, Accessoires) ohne .ROBLOSECURITY-Cookie zu laden – mit einem
+ * OpenCloud-API-Key (`x-api-key`), der für beliebige öffentliche Assets reicht.
+ *
+ * Unterstützt versionierte und unversionierte URLs:
+ *   /v2/assetId/123/version/456 → /asset-delivery-api/v1/assetId/123/version/456
+ *   /v1/asset?id=123            → /asset-delivery-api/v1/assetId/123
+ *
+ * @param {string} rawUrl assetdelivery.roblox.com-URL
+ * @returns {string|null} OpenCloud-URL oder null, wenn keine Asset-ID ableitbar ist
+ */
+export function openCloudAssetDeliveryUrl(rawUrl) {
+  let url;
+  try { url = new URL(rawUrl); } catch { return null; }
+  const versioned = /^\/v[12]\/assetId\/(\d+)(?:\/version\/(\d+))?$/.exec(url.pathname);
+  if (versioned) {
+    const [, id, version] = versioned;
+    return version
+      ? `https://apis.roblox.com/asset-delivery-api/v1/assetId/${id}/version/${version}`
+      : `https://apis.roblox.com/asset-delivery-api/v1/assetId/${id}`;
+  }
+  const id = url.searchParams.get("id");
+  if (id && /^\d+$/.test(id)) {
+    return `https://apis.roblox.com/asset-delivery-api/v1/assetId/${id}`;
+  }
+  return null;
+}
