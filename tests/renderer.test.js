@@ -54,3 +54,13 @@ test("alle statischen roavatar-Assets sind im Repo vorhanden", () => {
     assert.ok(existsSync(new URL(file, root)), `fehlendes lokales Asset: ${file}`);
   }
 });
+
+test("Renderer löst die lokalen Rig-Pfade deterministisch auf", () => {
+  const client = readFileSync(new URL("src/renderer-client.js", root), "utf8");
+  // Der ContentMap der Bibliothek wird beim Import gebaut – der Bot fängt die
+  // Rig-Auflösung deshalb selbst ab, damit die lokalen Rigs immer absolut laden.
+  assert.match(client, /roavatar:\/\/RigR15\.rbxm"\) return "\/assets\/RigR15\.rbxm/);
+  assert.match(client, /roavatar:\/\/RigR6\.rbxm"\) return "\/assets\/RigR6\.rbxm/);
+  // Lokale Texturen (Standard-Gesicht, Partikel) dürfen nicht am Proxy-HTTPS-Check scheitern.
+  assert.match(client, /const remote = \/\^https:\\\/\\\//);
+});

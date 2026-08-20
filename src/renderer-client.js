@@ -125,6 +125,21 @@ FLAGS.GEAR_ENABLED = false;
 FLAGS.API_REQUEST_RETRY = true;
 
 /**
+ * Die Rig-URLs (`roavatar://RigR15.rbxm` / `RigR6`) löst die Bibliothek über
+ * ihren ContentMap auf, der beim Import mit den damaligen Flag-Werten gebaut
+ * wird. Damit die lokalen Rigs unabhängig von dieser Initialisierung immer
+ * absolut vom Bot geladen werden, fängt der Bot die Auflösung selbst ab.
+ * (parseAssetString wird zur Laufzeit über API.Misc aufgerufen, daher greift
+ * der Wrapper für alle internen Asset-Downloads.)
+ */
+const parseAssetStringOriginal = API.Misc.parseAssetString.bind(API.Misc);
+API.Misc.parseAssetString = (str) => {
+  if (str === "roavatar://RigR15.rbxm") return "/assets/RigR15.rbxm";
+  if (str === "roavatar://RigR6.rbxm") return "/assets/RigR6.rbxm";
+  return parseAssetStringOriginal(str);
+};
+
+/**
  * Avatar-Konfiguration laden UND dabei die `currentVersionId` jedes Assets
  * einsammeln, damit Asset-Downloads über den versionierten (cookie-freien)
  * Endpunkt laufen können. Das Originalverhalten bleibt unverändert.
@@ -141,15 +156,20 @@ API.Avatar.GetAvatarDetails = async (userId) => {
 /**
  * Das Original lädt Texturen direkt per <img> von rbxcdn.com — ohne Timeout und
  * am Proxy vorbei. Ein hängender CDN-Socket blockiert sonst den kompletten
- * Render bis zum globalen Zeitlimit. Deshalb: Abruf über den Proxy mit hartem
- * Zeitlimit; Fehler → undefined (gleiche Semantik wie image.onerror im Original).
+ * Render bis zum globalen Zeitlimit. Deshalb: Remote-Abruf über den Proxy mit
+ * hartem Zeitlimit; lokale Bibliotheks-Texturen (Standard-Gesicht, Partikel)
+ * direkt vom Bot. Fehler → undefined (gleiche Semantik wie image.onerror im Original).
  */
 API.Generic.LoadImage = (url) => (async () => {
   const fetchStr = await API.Misc.assetURLToCDNURL(url);
-  if (fetchStr instanceof Response || typeof fetchStr !== "string" || !/^https:\/\//i.test(fetchStr)) {
+  if (fetchStr instanceof Response || typeof fetchStr !== "string") {
     return undefined;
   }
-  const response = await fetchWithTimeout(`/roblox-proxy?url=${encodeURIComponent(rewriteAssetDeliveryUrl(fetchStr, assetVersionById))}`);
+  const remote = /^https:\/\//i.test(fetchStr);
+  const target = remote
+    ? `/roblox-proxy?url=${encodeURIComponent(rewriteAssetDeliveryUrl(fetchStr, assetVersionById))}`
+    : fetchStr;
+  const response = await fetchWithTimeout(target);
   if (!response.ok) return undefined;
   const blob = await response.blob();
   if (!blob.size) return undefined;
