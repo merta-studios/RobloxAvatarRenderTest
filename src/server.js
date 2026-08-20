@@ -17,6 +17,7 @@ import {
   Routes,
 } from "discord.js";
 
+import { getBuildInfo } from "./build-info.js";
 import { commands } from "./commands.js";
 import { config, validateBotConfig } from "./config.js";
 import { createDiscordNet } from "./discord-net.js";
@@ -200,9 +201,10 @@ const app = express();
 app.disable("x-powered-by");
 app.get("/health", (_request, response) => {
   const discordReady = Boolean(client?.isReady());
-  const healthy = discordReady || !config.healthRequireDiscord;
+  const healthy = discordReady || !config.healthRequireDiscord || config.skipDiscord;
   response.status(healthy ? 200 : 503).json({
     ok: healthy,
+    build: getBuildInfo(),
     busy,
     job: activeJob,
     uptime: Math.round(process.uptime()),
@@ -224,14 +226,14 @@ app.get("/health", (_request, response) => {
   });
 });
 
-async function fetchAllowedRobloxUrl(initialUrl, signal) {
+async function fetchAllowedRobloxUrl(initialUrl, signal, extraHeaders = {}) {
   let currentUrl = initialUrl;
   for (let redirects = 0; redirects <= 4; redirects += 1) {
     if (!isAllowedRobloxAssetUrl(currentUrl)) throw new Error("Unerlaubtes Redirect-Ziel");
     const result = await fetch(currentUrl, {
       redirect: "manual",
       signal,
-      headers: { "user-agent": "AvatarRenderTest/1.0" },
+      headers: { "user-agent": "AvatarRenderTest/1.0", ...extraHeaders },
     });
     if (result.status < 300 || result.status >= 400) return result;
     const location = result.headers.get("location");
@@ -245,11 +247,30 @@ app.get("/roblox-proxy", async (request, response) => {
   const url = String(request.query.url || "");
   if (!isAllowedRobloxAssetUrl(url)) return response.status(400).json({ error: "URL nicht erlaubt" });
 
+  const extraHeaders = {};
+  for (const name of ["roblox-assetformat", "roblox-place-id"]) {
+    const value = request.get(name);
+    if (value) extraHeaders[name] = value;
+  }
+
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 45_000);
   try {
-    const upstream = await fetchAllowedRobloxUrl(url, controller.signal);
-    if (!upstream.ok || !upstream.body) return response.status(upstream.status).end();
+    let upstream;
+    for (let attempt = 0; attempt <= 2; attempt += 1) {
+      upstream = await fetchAllowedRobloxUrl(url, controller.signal, extraHeaders);
+      if (upstream.ok) break;
+      const retryable = [429, 500, 502, 503, 504].includes(upstream.status);
+      if (!retryable || attempt === 2) break;
+      try { await upstream.body?.cancel?.(); } catch { /* ignore */ }
+      const wait = 400 * 2 ** attempt;
+      log(`[proxy] HTTP ${upstream.status} ${url.slice(0, 160)} – Retry in ${wait} ms (${attempt + 1}/2)`);
+      await sleep(wait);
+    }
+    if (!upstream.ok || !upstream.body) {
+      log(`[proxy] HTTP ${upstream.status} ${url.slice(0, 220)}`);
+      return response.status(upstream.status).end();
+    }
 
     const declaredSize = Number(upstream.headers.get("content-length") || 0);
     if (declaredSize > config.maxProxyBytes) return response.status(413).json({ error: "Asset zu groß" });
@@ -280,6 +301,16 @@ app.get("/roblox-proxy", async (request, response) => {
 app.use(express.static("dist", { index: "index.html", maxAge: "1h" }));
 app.get("/render", (_request, response) => response.sendFile("index.html", { root: "dist" }));
 
+function logRenderFailure(userId, state, pageError, consoleErrors, failedRequests) {
+  const phase = state?.phase || "unbekannt";
+  const labels = state?.assetLabels || [];
+  logError(`[render] userId=${userId}: Fehler in Phase ${phase}: ${state?.error || "unbekannt"}`);
+  logError(`[render] userId=${userId}: assetLabels=${JSON.stringify(labels.slice(-12))}`);
+  if (pageError) logError(`[render] userId=${userId}: pageError=${pageError}`);
+  if (consoleErrors.length) logError(`[render] userId=${userId}: console=${consoleErrors.slice(-20).join(" | ")}`);
+  if (failedRequests.length) logError(`[render] userId=${userId}: requestfailed=${failedRequests.slice(-20).join(" | ")}`);
+}
+
 async function renderAvatar(userId, onProgress) {
   let browser;
   const startedAt = Date.now();
@@ -288,6 +319,8 @@ async function renderAvatar(userId, onProgress) {
   let lastMessage = "";
   let pageCrashed = null;
   let pageError = null;
+  const consoleErrors = [];
+  const failedRequests = [];
   try {
     onProgress("browser", "Speichersparender 3D-Renderer wird gestartet …");
     browser = await puppeteer.launch({
@@ -317,11 +350,18 @@ async function renderAvatar(userId, onProgress) {
     const page = await browser.newPage();
     await page.setViewport({ width: 640, height: 640, deviceScaleFactor: 1 });
     page.on("console", (message) => {
-      if (message.type() === "error") console.error("Renderer:", message.text());
+      if (message.type() === "error") {
+        const text = message.text();
+        consoleErrors.push(text);
+        console.error("Renderer:", text);
+      }
     });
     page.on("pageerror", (error) => {
       pageError = redactSecrets(error?.message || String(error));
       console.error("Renderer page error:", pageError);
+    });
+    page.on("requestfailed", (request) => {
+      failedRequests.push(`${request.url()} (${request.failure()?.errorText || "?"})`);
     });
     page.on("error", (error) => {
       pageCrashed = error;
@@ -366,7 +406,20 @@ async function renderAvatar(userId, onProgress) {
         throw error;
       }
       const state = await page.evaluate(() => window.__renderState);
-      if (state?.error) throw new Error(state.error);
+      if (state?.error) {
+        logRenderFailure(userId, state, pageError, consoleErrors, failedRequests);
+        const failure = new Error(state.error);
+        failure.diagnostics = {
+          phase: state.phase,
+          message: state.message,
+          assetLabels: (state.assetLabels || []).slice(-12),
+          pageError,
+          consoleErrors: consoleErrors.slice(-20),
+          failedRequests: failedRequests.slice(-20),
+          buildId: state.buildId || getBuildInfo().id,
+        };
+        throw failure;
+      }
       onProgress("capture", "Finales PNG wird erzeugt …");
       const canvas = await page.$("canvas");
       if (!canvas) throw new Error("Renderer hat keine Bildfläche erzeugt.");
@@ -380,6 +433,36 @@ async function renderAvatar(userId, onProgress) {
     if (browser) await browser.close().catch(() => {});
   }
 }
+
+app.get("/render-debug", async (request, response) => {
+  if (!config.debugRenderEndpoint) {
+    return response.status(404).json({ error: "DEBUG_RENDER_ENDPOINT ist nicht aktiv." });
+  }
+  const userId = Number(request.query.userId);
+  if (!Number.isSafeInteger(userId) || userId <= 0) {
+    return response.status(400).json({ error: "userId fehlt oder ungültig" });
+  }
+  if (busy) {
+    return response.status(409).json({ error: "Renderer ist beschäftigt", job: activeJob });
+  }
+  busy = true;
+  activeJob = `debug:${userId}`;
+  try {
+    const png = await renderAvatar(userId, () => {});
+    response.json({ ok: true, userId, bytes: png.length, build: getBuildInfo() });
+  } catch (error) {
+    response.status(500).json({
+      ok: false,
+      userId,
+      error: error instanceof Error ? error.message : String(error),
+      diagnostics: error?.diagnostics || null,
+      build: getBuildInfo(),
+    });
+  } finally {
+    busy = false;
+    activeJob = null;
+  }
+});
 
 const statusColor = 0x5865f2;
 function progressEmbed(user, text, startedAt) {
@@ -679,7 +762,8 @@ async function startBot({ diagnose = true } = {}) {
   botRunning = true;
   try {
     const startedAt = Date.now();
-    log(`[startup] Start (Node ${process.version}, PID ${process.pid}).`);
+    const build = getBuildInfo();
+    log(`[startup] Start (Node ${process.version}, PID ${process.pid}, build=${build.id}, git=${build.gitCommit}, branch=${build.gitBranch}).`);
     log(`[startup] App-ID ${config.applicationId}, Commands ${config.guildId ? `nur für Guild ${config.guildId}` : "global"}, REST-Timeout ${config.restTimeoutMs / 1000} s, Login-Timeout ${config.loginTimeoutMs / 1000} s, Login-Versuche ${config.loginAttempts === 0 ? "unbegrenzt" : config.loginAttempts} (Backoff ${config.loginBackoffMs / 1000}–${config.loginBackoffMaxMs / 1000} s), DNS-Reihenfolge ${dnsOrder}, Healthcheck erfordert Discord: ${config.healthRequireDiscord ? "ja" : "nein"}, Debug-Logs ${config.debug ? "an" : "aus"}.`);
     for (const warning of configWarnings) logError(`[startup] Warnung: ${warning}`);
 
@@ -715,8 +799,15 @@ async function retryCommandRegistration() {
 }
 
 const server = app.listen(config.port, "0.0.0.0", () => {
+  const build = getBuildInfo();
   log(`[http] HTTP: Port ${config.port} (Healthcheck: /health).`);
-  void startBot();
+  log(`[startup] Build ${build.id} git=${build.gitCommit} branch=${build.gitBranch} node=${build.node}.`);
+  if (config.skipDiscord) {
+    botState.status = "skipped";
+    log("[startup] SKIP_DISCORD=true – Discord-Login übersprungen, Render-Pfad bleibt aktiv.");
+  } else {
+    void startBot();
+  }
 });
 
 function shutdownNow(exitCode) {

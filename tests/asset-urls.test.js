@@ -47,12 +47,14 @@ test("rewriteAssetDeliveryUrl lässt unbekannte IDs unverändert", () => {
   assert.equal(rewriteAssetDeliveryUrl(url, map), url);
 });
 
-test("rewriteAssetDeliveryUrl fasst contentRepresentationPriorityList nicht an", () => {
-  // Format-Aushandlung (z. B. Kopf-Formen) bleibt auf dem Legacy-Endpunkt,
-  // der sie zuverlässig unterstützt.
+test("rewriteAssetDeliveryUrl behält contentRepresentationPriorityList auf dem versionierten Endpunkt", () => {
   const map = new Map([["123", "456"]]);
   const url = "https://assetdelivery.roblox.com/v2/asset?id=123&contentRepresentationPriorityList=abc";
-  assert.equal(rewriteAssetDeliveryUrl(url, map), url);
+  const rewritten = rewriteAssetDeliveryUrl(url, map);
+  const parsed = new URL(rewritten);
+  assert.equal(parsed.pathname, "/v2/assetId/123/version/456");
+  assert.equal(parsed.searchParams.get("contentRepresentationPriorityList"), "abc");
+  assert.equal(parsed.searchParams.has("id"), false);
 });
 
 test("rewriteAssetDeliveryUrl ignoriert fremde Hosts, Protokolle und Pfade", () => {

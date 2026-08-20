@@ -194,6 +194,29 @@ npm start
 
 Der produktive Server liest `.env` nicht automatisch. Lokal die Werte in der Shell exportieren; bei Render werden sie im Dashboard gesetzt.
 
+## Troubleshooting: Render-Deploy schlägt fehl / alte Fehlermeldung bleibt
+
+Wenn Discord weiter **„Mindestens ein Avatar-Asset konnte nicht verarbeitet werden.“** ohne den Zusatz **`Fehlerstufe:`** zeigt, läuft **nicht** der aktuelle `main`-Commit. Render behält bei einem fehlgeschlagenen Docker-Build das vorherige Image.
+
+Ursache von PR #8: Das Dockerfile kopierte in der Vite-Stage nur `renderer-client.js` und `renderer.css`. `renderer-client.js` importiert aber `./asset-urls.js` – `vite build` bricht ab (`Could not resolve "./asset-urls.js"`), der neue Code geht nie live.
+
+Prüfen:
+
+1. Render → Service → **Events**: steht dort `Build failed` zum Commit von `main`?
+2. `GET /health` muss ein Feld `build` enthalten, z. B. `{ "id": "docker-src-copy-2026-08-20", "gitCommit": "…" }`. Fehlt `build`, ist der Deploy veraltet.
+3. In den Logs muss `[startup] Build docker-src-copy-2026-08-20 git=…` stehen.
+
+Nach einem Fix: **Manual Deploy** von `main` anstoßen und warten, bis Events `Deploy live` zeigt – nicht nur `Build started`.
+
+E2E ohne Discord (in der Render-Shell, das Image enthält Chromium):
+
+```bash
+SKIP_DISCORD=true PORT=10000 node src/server.js   # nur lokal; auf Render läuft der Server schon
+node scripts/e2e-render.mjs http://127.0.0.1:10000 1 /tmp/render-e2e.png
+```
+
+Optional `DEBUG_RENDER_ENDPOINT=true` setzen, dann `GET /render-debug?userId=1` (JSON mit Fehlerstufe und `assetLabels`, ohne Discord).
+
 ## Troubleshooting: „Der Render hat das Zeitlimit überschritten“
 
 Der Fehler kommt mit Zusatzinfo, z. B. `… (letzte Phase: „assets“, zuletzt: „Originale Roblox-Assets und Meshes werden geladen …“)`. So liest man das:

@@ -26,11 +26,16 @@ export const config = {
   healthRequireDiscord: (process.env.HEALTH_REQUIRE_DISCORD ?? "false") === "true",
   autoSelectFamily: process.env.AUTO_SELECT_FAMILY === "true",
   debug: process.env.DISCORD_DEBUG === "true",
+  // E2E / lokaler Render-Pfad ohne Discord-Gateway.
+  skipDiscord: (process.env.SKIP_DISCORD ?? "false") === "true",
+  // GET /render-debug?userId=… (kein Discord). Nur bewusst einschalten.
+  debugRenderEndpoint: (process.env.DEBUG_RENDER_ENDPOINT ?? "false") === "true",
 };
 
 const TOKEN_PATTERN = /^[\w-]{20,}\.[\w-]{5,}\.[\w-]{20,}$/;
 
 export function validateBotConfig() {
+  if (config.skipDiscord) return [];
   const missing = [];
   if (!config.token) missing.push("DISCORD_TOKEN");
   if (!config.applicationId) missing.push("DISCORD_APPLICATION_ID");
