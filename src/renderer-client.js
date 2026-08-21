@@ -12,7 +12,7 @@ import {
 import { BUILD_ID } from "./build-info.js";
 import { createAssetVersionMap, recordAssetVersions, rewriteAssetDeliveryUrl } from "./asset-urls.js";
 import { extractAssetIdFromUrl, guardGetAssetBuffer, guardGetMesh, guardGetRBX } from "./asset-loader-guard.js";
-import { patchAnimatorWrapper, patchHumanoidDescriptionApply } from "./library-guards.js";
+import { patchAnimatorWrapper, patchHumanoidDescriptionApply, patchOutfitRenderer } from "./library-guards.js";
 import { withStallDeadline } from "./render-deadline.js";
 import { createFetchWithTimeout } from "./fetch-timeout.js";
 import "./renderer.css";
@@ -211,12 +211,16 @@ const recordSkippedAnimation = ({ method, id, error }) => {
 };
 patchAnimatorWrapper(AnimatorWrapper, { onSkipped: recordSkippedAnimation });
 patchHumanoidDescriptionApply(HumanoidDescriptionWrapper, {
-  onSkipped: ({ error }) => {
-    // Kein stiller Hänger mehr: _updateOutfit feuert stattdessen
-    // onError("humanoidDescription") → konkrete Fehlermeldung statt Watchdog.
-    console.warn(`[guard] applyDescription übersprungen: ${error?.message || error}`);
+  onSkipped: ({ method, error }) => {
+    console.warn(`[guard] HumanoidDescription.${method} übersprungen: ${error?.message || error}`);
   },
 });
+// roavatar-renderer 1.6.2 kann onSuccess/onRenderSuccess synchron feuern, kurz
+// bevor prepareForThumbnail seinen Listener verbindet. Das erklärt den
+// beobachteten Stillstand mit leerem Fortschrittssignal `assets|` trotz bereits
+// abgeschlossener Downloads. Der Patch spielt ausschließlich verpasste,
+// anhand des Objektzustands bestätigte Signale nach.
+patchOutfitRenderer(OutfitRenderer);
 
 /**
  * Die Rig-URLs (`roavatar://RigR15.rbxm` / `RigR6`) löst die Bibliothek über

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { patchAnimatorWrapper, patchHumanoidDescriptionApply } from "../src/library-guards.js";
+import { patchAnimatorWrapper, patchHumanoidDescriptionApply, patchOutfitRenderer } from "../src/library-guards.js";
 
 /** Dummy-Klasse mit dem gleichen Methoden-Vertrag wie AnimatorWrapper. */
 function makeAnimatorClass() {
@@ -95,8 +95,78 @@ test("patchHumanoidDescriptionApply wandelt Rejections in undefined um (onError 
   assert.equal(patchHumanoidDescriptionApply(DummyDescription), false, "zweiter Patch muss ein No-op sein");
 });
 
+test("HumanoidDescription-Arbeitsschritt läuft nach Deadline weiter statt pending zu bleiben", async () => {
+  class DummyDescription {
+    _applyAccessories() {
+      return new Promise(() => {});
+    }
+    async applyDescription() {
+      await this._applyAccessories();
+      return "avatar-fertig";
+    }
+  }
+  const skipped = [];
+  patchHumanoidDescriptionApply(DummyDescription, {
+    stepDeadlineMs: 20,
+    onSkipped: (info) => skipped.push(info),
+  });
+  const result = await Promise.race([
+    new DummyDescription().applyDescription(),
+    new Promise((resolve) => setTimeout(() => resolve("HANG"), 100)),
+  ]);
+  assert.equal(result, "avatar-fertig");
+  assert.equal(skipped.length, 1);
+  assert.equal(skipped[0].method, "_applyAccessories");
+  assert.match(skipped[0].error.message, /Zeitlimit/);
+});
+
+test("OutfitRenderer-Patch spielt verpasste onSuccess/onRenderSuccess-Signale nach", async () => {
+  class DummyEvent {
+    callbacks = new Set();
+    Connect(callback) {
+      this.callbacks.add(callback);
+      return { Disconnect: () => this.callbacks.delete(callback) };
+    }
+    Fire() {
+      for (const callback of [...this.callbacks]) callback();
+    }
+  }
+  class DummyOutfitRenderer {
+    currentRig = {};
+    currentlyUpdating = false;
+    currentlyChangingRig = false;
+    hasFiredFullyRendered = false;
+    onSuccess = new DummyEvent();
+    onRenderSuccess = new DummyEvent();
+    fireFullyRenderedIfNeeded() {
+      if (!this.hasFiredFullyRendered) {
+        this.hasFiredFullyRendered = true;
+        this.onRenderSuccess.Fire();
+      }
+    }
+    async prepareForThumbnail() {
+      // Beide Events wurden im Produktionsfall bereits synchron gefeuert,
+      // bevor der jeweilige Listener verbunden wurde.
+      await new Promise((resolve) => this.onSuccess.Connect(resolve));
+      this.onRenderSuccess.Fire();
+      this.hasFiredFullyRendered = false;
+      await new Promise((resolve) => this.onRenderSuccess.Connect(resolve));
+      return true;
+    }
+  }
+
+  assert.equal(patchOutfitRenderer(DummyOutfitRenderer), true);
+  const result = await Promise.race([
+    new DummyOutfitRenderer().prepareForThumbnail(),
+    new Promise((resolve) => setTimeout(() => resolve("HANG"), 100)),
+  ]);
+  assert.equal(result, true);
+  assert.equal(patchOutfitRenderer(DummyOutfitRenderer), false, "zweiter Patch muss ein No-op sein");
+});
+
 test("Patches ignorieren Klassen ohne passende Methoden", () => {
   assert.deepEqual(patchAnimatorWrapper(null), []);
   assert.deepEqual(patchAnimatorWrapper(class Foo {}), []);
   assert.equal(patchHumanoidDescriptionApply(class Bar {}), false);
+  assert.equal(patchOutfitRenderer(class Baz {}), false);
 });

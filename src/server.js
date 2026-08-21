@@ -357,7 +357,7 @@ app.get("/roblox-proxy", async (request, response) => {
 app.use(express.static("dist", { index: "index.html", maxAge: "1h" }));
 app.get("/render", (_request, response) => response.sendFile("index.html", { root: "dist" }));
 
-function logRenderFailure(userId, state, pageError, consoleErrors, failedRequests) {
+function logRenderFailure(userId, state, pageError, consoleErrors, failedRequests, httpErrors) {
   const phase = state?.phase || "unbekannt";
   const labels = state?.assetLabels || [];
   logError(`[render] userId=${userId}: Fehler in Phase ${phase}: ${state?.error || "unbekannt"}`);
@@ -365,6 +365,9 @@ function logRenderFailure(userId, state, pageError, consoleErrors, failedRequest
   if (pageError) logError(`[render] userId=${userId}: pageError=${pageError}`);
   if (consoleErrors.length) logError(`[render] userId=${userId}: console=${consoleErrors.slice(-20).join(" | ")}`);
   if (failedRequests.length) logError(`[render] userId=${userId}: requestfailed=${failedRequests.slice(-20).join(" | ")}`);
+  // Puppeteers requestfailed feuert NICHT bei HTTP 4xx/5xx. Ohne response-Log
+  // blieb vom beobachteten 404 nur Chromiums nutzloses „Failed to load resource“.
+  if (httpErrors.length) logError(`[render] userId=${userId}: http=${httpErrors.slice(-20).join(" | ")}`);
 }
 
 async function renderAvatar(userId, onProgress) {
@@ -377,6 +380,7 @@ async function renderAvatar(userId, onProgress) {
   let pageError = null;
   const consoleErrors = [];
   const failedRequests = [];
+  const httpErrors = [];
   try {
     onProgress("browser", "Speichersparender 3D-Renderer wird gestartet …");
     browser = await puppeteer.launch({
@@ -418,6 +422,11 @@ async function renderAvatar(userId, onProgress) {
     });
     page.on("requestfailed", (request) => {
       failedRequests.push(`${request.url()} (${request.failure()?.errorText || "?"})`);
+    });
+    page.on("response", (pageResponse) => {
+      if (pageResponse.status() >= 400) {
+        httpErrors.push(`HTTP ${pageResponse.status()} ${redactSecrets(pageResponse.url())}`);
+      }
     });
     page.on("error", (error) => {
       pageCrashed = error;
@@ -463,7 +472,7 @@ async function renderAvatar(userId, onProgress) {
       }
       const state = await page.evaluate(() => window.__renderState);
       if (state?.error) {
-        logRenderFailure(userId, state, pageError, consoleErrors, failedRequests);
+        logRenderFailure(userId, state, pageError, consoleErrors, failedRequests, httpErrors);
         const failure = new Error(state.error);
         failure.diagnostics = {
           phase: state.phase,
@@ -472,6 +481,7 @@ async function renderAvatar(userId, onProgress) {
           pageError,
           consoleErrors: consoleErrors.slice(-20),
           failedRequests: failedRequests.slice(-20),
+          httpErrors: httpErrors.slice(-20),
           buildId: state.buildId || getBuildInfo().id,
         };
         throw failure;
@@ -620,6 +630,9 @@ async function handleRender(interaction) {
       const failed = (diagnostics.failedRequests || []).filter(Boolean).slice(0, 3)
         .map((entry) => String(entry).replace(/^https?:\/\//, "").slice(0, 110));
       if (failed.length) notes.push(`Fehlgeschlagene Requests: ${failed.join(" | ")}`);
+      const httpProblems = (diagnostics.httpErrors || []).filter(Boolean).slice(0, 3)
+        .map((entry) => String(entry).replace(/^HTTP (\d+) https?:\/\//, "HTTP $1 ").slice(0, 130));
+      if (httpProblems.length) notes.push(`HTTP-Fehler: ${httpProblems.join(" | ")}`);
       const consoleProblems = (diagnostics.consoleErrors || []).filter(Boolean).slice(0, 3)
         .map((entry) => String(entry).slice(0, 150));
       if (consoleProblems.length) notes.push(`Console: ${consoleProblems.join(" | ")}`);
