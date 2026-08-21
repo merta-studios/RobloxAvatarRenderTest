@@ -59,6 +59,10 @@ const state = window.__renderState = {
   // Assets, die nicht geladen werden konnten und deshalb übersprungen wurden
   // (z. B. UGC mit HTTP 401 – Roblox verlangt dafür seit April 2025 Authentifizierung).
   skippedAssets: [],
+  // Detaillierte Gründe pro übersprungenem Asset ({id, reason}) – z. B.
+  // "HTTP 401" (kein/abgelehnter OpenCloud-Key) oder "Zeitlimit 150 s"
+  // (Antwort-Contract-Verstoß oder hängender Download).
+  skippedAssetDetails: [],
   // Interne Diagnose der Thumbnail-Zustandsmaschine: konkreter Teilschritt statt
   // nur „assets“, damit ein Stall nie wieder als leeres `assets|`-Signal endet.
   prepareStage: null,
@@ -72,6 +76,8 @@ const state = window.__renderState = {
 
 /** Asset-IDs, die übersprungen wurden (Fehlschlag oder Zeitlimit). */
 const skippedAssetIds = new Set();
+/** Asset-ID/URL → Grund des Überspringens (für die Discord-Diagnose). */
+const skippedAssetDetails = new Map();
 
 function report(phase, message) {
   Object.assign(state, { phase, message, updatedAt: Date.now() });
@@ -230,10 +236,11 @@ FLAGS.API_REQUEST_RETRY = true;
  * Rest des Avatars gerendert. Fehlgeschlagene Assets landen in
  * `state.skippedAssets` für die Discord-Antwort.
  */
-const recordSkipped = (url) => {
+const recordSkipped = (url, reason) => {
   const id = extractAssetIdFromUrl(url);
-  if (id) skippedAssetIds.add(id);
-  else skippedAssetIds.add(String(url).slice(0, 96));
+  const key = id || String(url).slice(0, 96);
+  skippedAssetIds.add(key);
+  skippedAssetDetails.set(key, String(reason || "").slice(0, 80) || "unbekannt");
 };
 const getAssetBufferOriginal = API.Asset.GetAssetBuffer.bind(API.Asset);
 API.Asset.GetAssetBuffer = guardGetAssetBuffer(getAssetBufferOriginal, {
@@ -261,7 +268,10 @@ API.Asset.GetRBX = guardGetRBX(getRbxOriginal, {
  */
 const recordSkippedAnimation = ({ method, id, error }) => {
   const idStr = String(id ?? "");
-  if (/^\d+$/.test(idStr)) skippedAssetIds.add(idStr);
+  if (/^\d+$/.test(idStr)) {
+    skippedAssetIds.add(idStr);
+    skippedAssetDetails.set(idStr, `Animation (${method}) fehlgeschlagen`);
+  }
   console.warn(`[guard] Animation übersprungen (${method}${idStr ? `, Asset ${idStr}` : ""}): ${error?.message || error}`);
 };
 patchAnimatorWrapper(AnimatorWrapper, { onSkipped: recordSkippedAnimation });
@@ -467,6 +477,7 @@ async function render(userId) {
   });
   report("done", "Render fertig.");
   state.skippedAssets = [...skippedAssetIds];
+  state.skippedAssetDetails = [...skippedAssetDetails].map(([id, reason]) => ({ id, reason }));
   state.done = true;
 }
 
@@ -480,6 +491,7 @@ if (!Number.isSafeInteger(userId) || userId <= 0) {
     console.error(error);
     state.error = error instanceof Error ? error.message : String(error);
     state.skippedAssets = [...skippedAssetIds];
+    state.skippedAssetDetails = [...skippedAssetDetails].map(([id, reason]) => ({ id, reason }));
     state.done = true;
     report("error", state.error);
   });

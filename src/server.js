@@ -22,10 +22,12 @@ import { commands } from "./commands.js";
 import { config, validateBotConfig } from "./config.js";
 import { createDiscordNet } from "./discord-net.js";
 import {
+  buildLocationsEnvelope,
   extractOpenCloudAssetLocation,
   inspectOpenCloudAssetResponse,
   isAllowedRobloxAssetUrl,
-  openCloudAssetDeliveryUrl,
+  openCloudAssetDeliveryUrlCandidates,
+  pickEnvelopeLocation,
   resolveRobloxUser,
   RobloxError,
 } from "./roblox.js";
@@ -206,6 +208,75 @@ const botState = {
 
 const app = express();
 app.disable("x-powered-by");
+
+/**
+ * OpenCloud-API-Key-Diagnose: Prüft per Probe-Request gegen die OpenCloud
+ * Asset-Delivery-API, ob der konfigurierte Key von Roblox akzeptiert wird
+ * (200 + Location) oder abgelehnt wird (401/403 – z. B. fehlender Scope
+ * `legacy-asset:manage` oder Community- statt User-Key). Ergebnis steht in
+ * /health unter openCloud.probe und in der Discord-Antwort, damit „Key
+ * gesetzt, Assets fehlen trotzdem“ unterscheidbar wird von „Key fehlt“.
+ */
+const openCloudState = {
+  probeStatus: null, // "ok" | "no-location" | "rejected" | "http-error" | "network-error" | null
+  probeHttp: null,
+  probeMessage: null,
+  probeAt: null,
+};
+
+// Roblox 2.0 Torso: Roblox-eigenes Asset von 2011 – dauerhaft stabil und für
+// die Probe ausreichend, weil der Endpunkt selbst jeden Request authentifiziert.
+const OPEN_CLOUD_PROBE_ASSET_ID = "27112025";
+const OPEN_CLOUD_PROBE_STALE_MS = 5 * 60 * 1000;
+
+function openCloudProbeSnapshot() {
+  return {
+    status: openCloudState.probeStatus,
+    http: openCloudState.probeHttp,
+    message: openCloudState.probeMessage,
+    at: openCloudState.probeAt,
+  };
+}
+
+async function probeOpenCloudApiKey(reason = "startup") {
+  if (!config.openCloudApiKey) return;
+  try {
+    const { response } = await fetchAllowedRobloxUrl(
+      `https://apis.roblox.com/asset-delivery-api/v1/assetId/${OPEN_CLOUD_PROBE_ASSET_ID}`,
+      AbortSignal.timeout(15_000),
+      { "x-api-key": config.openCloudApiKey },
+    );
+    openCloudState.probeHttp = response.status;
+    if (response.ok) {
+      const inspected = await inspectOpenCloudAssetResponse(response);
+      const location = inspected.kind === "json" ? pickEnvelopeLocation(inspected.json) : null;
+      openCloudState.probeStatus = location ? "ok" : "no-location";
+      openCloudState.probeMessage = location ? null : compactBodySnippet(inspected.bodyText || "");
+      log(`[opencloud] Key-Probe (${reason}): HTTP ${response.status} – Key gültig${location ? ", Asset-Delivery liefert Locations." : ", aber Antwort ohne Location."}`);
+      return;
+    }
+    openCloudState.probeStatus = "rejected";
+    openCloudState.probeMessage = await readResponseBodySnippet(response, 200);
+    logError(`[opencloud] Key-Probe (${reason}): HTTP ${response.status} – Roblox lehnt den Key AB. Body: ${openCloudState.probeMessage}. `
+      + "Prüfe unter https://create.roblox.com/dashboard/credentials, ob der Key als USER-Key angelegt ist und den Scope `legacy-asset:manage` hat. "
+      + "Danach den Service neu deployen, damit die Umgebungsvariable gelesen wird.");
+  } catch (error) {
+    openCloudState.probeStatus = "network-error";
+    openCloudState.probeHttp = null;
+    openCloudState.probeMessage = error?.message || String(error);
+    logError(`[opencloud] Key-Probe (${reason}) gescheitert: ${openCloudState.probeMessage}`);
+  } finally {
+    openCloudState.probeAt = new Date().toISOString();
+  }
+}
+
+/** Startet eine Probe, wenn keine oder eine veraltete existiert (nicht blockierend). */
+function refreshOpenCloudProbeIfNeeded(reason) {
+  if (!config.openCloudApiKey) return;
+  const age = openCloudState.probeAt ? Date.now() - Date.parse(openCloudState.probeAt) : Infinity;
+  if (age <= OPEN_CLOUD_PROBE_STALE_MS && openCloudState.probeStatus) return;
+  void probeOpenCloudApiKey(reason);
+}
 app.get("/health", (_request, response) => {
   const discordReady = Boolean(client?.isReady());
   const healthy = discordReady || !config.healthRequireDiscord || config.skipDiscord;
@@ -217,6 +288,7 @@ app.get("/health", (_request, response) => {
     uptime: Math.round(process.uptime()),
     openCloud: {
       configured: Boolean(config.openCloudApiKey),
+      probe: openCloudProbeSnapshot(),
     },
     discord: {
       ready: discordReady,
@@ -254,12 +326,62 @@ async function fetchAllowedRobloxUrl(initialUrl, signal, extraHeaders = {}) {
       signal,
       headers: requestHeaders,
     });
-    if (result.status < 300 || result.status >= 400) return result;
+    // Nach dem Folgen eines Redirects wird die finale URL mitgeliefert: Der
+    // Proxy braucht sie, um Binär-Antworten in eine Locations-Envelope zu
+    // verpacken (siehe buildLocationsEnvelope in roblox.js).
+    if (result.status < 300 || result.status >= 400) return { response: result, finalUrl: currentUrl };
     const location = result.headers.get("location");
-    if (!location) return result;
+    if (!location) return { response: result, finalUrl: currentUrl };
+    try { void result.body?.cancel?.(); } catch { /* Redirect-Body wird nicht gebraucht */ }
     currentUrl = new URL(location, currentUrl).href;
   }
   throw new Error("Zu viele Redirects");
+}
+
+/**
+ * Antwort-Contract des Proxys für assetdelivery.roblox.com-Anfragen:
+ * roavatar-renderer läuft mit ASSETDELIVERY_V2=true und ruft auf JEDER
+ * assetdelivery/v2-Antwort `response.json()` + `data.locations[0].location`
+ * auf (API.Misc.getCDNURLFromAssetDelivery). Roh-Binärdaten lassen diese
+ * Promise-Kette OHNE catch scheitern – das Asset settles dann nie und wird
+ * erst durch die Guard-Deadline nach 150 s übersprungen (beobachtet als
+ * „4 Assets übersprungen“ bei ~195 s Renderzeit trotz gültigem API-Key).
+ *
+ * Deshalb liefert der Proxy für Asset-Delivery-Anfragen ausnahmslos diese
+ * JSON-Envelope; die Binärdaten holt sich die Bibliothek danach selbst über
+ * die CDN-Location (erlaubter Host, wieder durch den Proxy).
+ *
+ * @param {string} location CDN-Location aus der Asset-Delivery-Antwort
+ * @param {string|null} assetFormat bekanntes Asset-Format, sonst "source"
+ * @returns {Response} 200-Antwort mit JSON-Envelope
+ */
+function locationsEnvelopeResponse(location, assetFormat = null) {
+  const body = JSON.stringify(buildLocationsEnvelope(location, assetFormat));
+  return new Response(body, {
+    status: 200,
+    headers: { "content-type": "application/json" },
+  });
+}
+
+function isRetryableHttpStatus(status) {
+  return [429, 500, 502, 503, 504].includes(status);
+}
+
+/** Gibt den Body einer nicht weiter verwendeten Response frei (Socket-Leaks vermeiden). */
+function discardBody(response) {
+  try { void response.body?.cancel?.(); } catch { /* Body bereits weg */ }
+}
+
+/** fetchAllowedRobloxUrl mit Retry für Drosselung/Serverfehler (2 Backoff-Versuche). */
+async function fetchAllowedRobloxUrlWithRetry(url, signal, extraHeaders) {
+  for (let attempt = 0; ; attempt += 1) {
+    const { response, finalUrl } = await fetchAllowedRobloxUrl(url, signal, extraHeaders);
+    if (!isRetryableHttpStatus(response.status) || attempt >= 2) return { response, finalUrl };
+    try { void response.body?.cancel?.(); } catch { /* Body wird verworfen */ }
+    const wait = 400 * 2 ** attempt;
+    log(`[proxy] HTTP ${response.status} ${url.slice(0, 160)} – Retry in ${wait} ms (${attempt + 1}/2)`);
+    await sleep(wait);
+  }
 }
 
 function compactBodySnippet(value, maxChars = 200) {
@@ -308,7 +430,16 @@ function urlHost(rawUrl) {
  * unauthentifiziert HTTP 401 liefert); schlägt sie fehl, folgt der normale
  * assetdelivery-Pfad mit Retry.
  *
- * @returns {Promise<{upstream: Response, via: string}>}
+ * WICHTIG – Antwort-Contract: Für assetdelivery.roblox.com wird NIE der rohe
+ * Asset-Binary durchgereicht, sondern immer eine JSON-Locations-Envelope
+ * (siehe locationsEnvelopeResponse). Die Bibliothek lädt das Binary danach
+ * selbst über die CDN-Location. Vorher streamte der Proxy bei erfolgreicher
+ * OpenCloud-Nachladung die Binärdaten direkt – `response.json()` der Bibliothek
+ * scheiterte dann in einer Promise-Kette ohne catch, das Asset löste nie auf
+ * und wurde erst nach der 150-s-Guard-Deadline übersprungen. Genau das war die
+ * Ursache für „Shirt/Hose/Accessoire fehlen trotz API-Key“.
+ *
+ * @returns {Promise<{upstream: Response|null, via: string, openCloudStatus: number|null}>}
  */
 async function fetchUpstreamWithFallbacks(url, extraHeaders, controller) {
   const isAssetDelivery = (() => {
@@ -316,63 +447,73 @@ async function fetchUpstreamWithFallbacks(url, extraHeaders, controller) {
   })();
 
   if (config.openCloudApiKey && isAssetDelivery) {
-    const openCloudUrl = openCloudAssetDeliveryUrl(url);
-    if (openCloudUrl) {
+    const preferredFormat = extraHeaders["roblox-assetformat"] || null;
+    for (const openCloudUrl of openCloudAssetDeliveryUrlCandidates(url)) {
       try {
-        const apiResponse = await fetchAllowedRobloxUrl(openCloudUrl, controller.signal, {
+        const { response: apiResponse, finalUrl } = await fetchAllowedRobloxUrlWithRetry(openCloudUrl, controller.signal, {
           ...extraHeaders,
           "x-api-key": config.openCloudApiKey,
         });
         const inspected = await inspectOpenCloudAssetResponse(apiResponse);
         if (inspected.kind === "raw") {
-          // Manche Varianten liefern den Asset-Body direkt statt eines
-          // Location-JSON. inspectOpenCloudAssetResponse liest nur einen Clone,
-          // daher bleibt dieser Body für den Proxy-Stream unangetastet.
-          if (apiResponse.ok && apiResponse.body) {
-            log(`[proxy] OpenCloud-Rohcontent: HTTP ${apiResponse.status}, content-type=${inspected.contentType || "?"}, Grund=${inspected.reason}, ${openCloudUrl.slice(0, 140)}`);
-            return { upstream: apiResponse, via: "opencloud-raw" };
+          if (apiResponse.ok && apiResponse.body && finalUrl !== openCloudUrl) {
+            // OpenCloud hat direkt zum CDN-Binary weitergeleitet: Location
+            // (= finale URL) in die Envelope packen statt Binärdaten zu streamen.
+            log(`[proxy] OpenCloud-Rohcontent-Weiterleitung: HTTP ${apiResponse.status} → ${finalUrl.slice(0, 100)} (Envelope)`);
+            return { upstream: locationsEnvelopeResponse(finalUrl), via: "opencloud-raw", openCloudStatus: apiResponse.status };
           }
           const bodySnippet = inspected.bodyText
             ? compactBodySnippet(inspected.bodyText)
             : await readResponseBodySnippet(apiResponse);
-          log(`[proxy] OpenCloud ohne JSON-Asset: HTTP ${apiResponse.status}, content-type=${inspected.contentType || "?"}, Grund=${inspected.reason}, body="${bodySnippet}", ${openCloudUrl.slice(0, 140)} – Fallback auf assetdelivery`);
-        } else {
-          const location = extractOpenCloudAssetLocation(inspected.json);
-          if (location && !isAllowedRobloxAssetUrl(location)) {
-            log(`[proxy] OpenCloud-Location mit unerlaubtem Host ${urlHost(location)}: HTTP ${apiResponse.status}, ${location.slice(0, 140)} – Fallback auf assetdelivery`);
-          } else if (apiResponse.ok && location) {
-            const content = await fetchAllowedRobloxUrl(location, controller.signal, extraHeaders);
-            if (content.ok && content.body) {
-              log(`[proxy] OpenCloud: ${url.slice(0, 140)} → ${location.slice(0, 100)}`);
-              return { upstream: content, via: "opencloud" };
-            }
-            log(`[proxy] OpenCloud-Location HTTP ${content.status}: ${location.slice(0, 140)}`);
-          } else if (!location) {
-            const errors = getOpenCloudErrors(inspected.json);
-            const bodySnippet = compactBodySnippet(inspected.bodyText);
-            log(`[proxy] OpenCloud ohne Location: HTTP ${apiResponse.status}, content-type=${inspected.contentType || "?"}, body="${bodySnippet}", Errors=${formatOpenCloudErrors(errors)}, ${openCloudUrl.slice(0, 140)} – Fallback auf assetdelivery`);
-          } else {
-            log(`[proxy] OpenCloud HTTP ${apiResponse.status} trotz Location, content-type=${inspected.contentType || "?"}: ${location.slice(0, 140)} – Fallback auf assetdelivery`);
-          }
+          discardBody(apiResponse);
+          log(`[proxy] OpenCloud ohne JSON-Asset: HTTP ${apiResponse.status}, content-type=${inspected.contentType || "?"}, Grund=${inspected.reason}, body="${bodySnippet}", ${openCloudUrl.slice(0, 140)} – nächster Versuch`);
+          continue;
         }
+        const location = pickEnvelopeLocation(inspected.json, preferredFormat)
+          || extractOpenCloudAssetLocation(inspected.json);
+        if (location && !isAllowedRobloxAssetUrl(location)) {
+          discardBody(apiResponse);
+          log(`[proxy] OpenCloud-Location mit unerlaubtem Host ${urlHost(location)}: HTTP ${apiResponse.status}, ${location.slice(0, 140)} – nächster Versuch`);
+          continue;
+        }
+        if (apiResponse.ok && location) {
+          // NICHT die Binärdaten nachladen: Location in der Envelope zurück-
+          // geben, die Bibliothek fordert sie danach selbst über den Proxy an.
+          log(`[proxy] OpenCloud: ${url.slice(0, 140)} → ${location.slice(0, 100)} (Envelope)`);
+          return { upstream: locationsEnvelopeResponse(location, preferredFormat), via: "opencloud", openCloudStatus: apiResponse.status };
+        }
+        const errors = getOpenCloudErrors(inspected.json);
+        const bodySnippet = compactBodySnippet(inspected.bodyText);
+        discardBody(apiResponse);
+        log(`[proxy] OpenCloud ohne Location: HTTP ${apiResponse.status}, body="${bodySnippet}", Errors=${formatOpenCloudErrors(errors)}, ${openCloudUrl.slice(0, 140)} – nächster Versuch`);
       } catch (error) {
-        reportError("[proxy] OpenCloud-Fallback", error);
+        reportError("[proxy] OpenCloud-Fehler", error);
       }
     }
   }
 
   for (let attempt = 0; attempt <= 2; attempt += 1) {
-    const upstream = await fetchAllowedRobloxUrl(url, controller.signal, extraHeaders);
-    if (upstream.ok) return { upstream, via: "assetdelivery" };
-    const retryable = [429, 500, 502, 503, 504].includes(upstream.status);
-    if (!retryable || attempt === 2) return { upstream, via: "assetdelivery" };
-    try { await upstream.body?.cancel?.(); } catch { /* ignore */ }
+    const { response: upstream, finalUrl } = await fetchAllowedRobloxUrl(url, controller.signal, extraHeaders);
+    if (upstream.ok && isAssetDelivery) {
+      const inspected = await inspectOpenCloudAssetResponse(upstream);
+      if (inspected.kind === "raw") {
+        // Öffentlicher Endpunkt hat zur Binärdatei weitergeleitet (alte
+        // /v1/asset/?id=-Form): ebenfalls Envelope statt Binary.
+        discardBody(upstream);
+        log(`[proxy] assetdelivery-Binärweiterleitung → Envelope: ${finalUrl.slice(0, 100)}`);
+        return { upstream: locationsEnvelopeResponse(finalUrl), via: "assetdelivery-envelope", openCloudStatus: null };
+      }
+      return { upstream, via: "assetdelivery", openCloudStatus: null };
+    }
+    const retryable = isRetryableHttpStatus(upstream.status);
+    if (!retryable || attempt === 2) return { upstream, via: "assetdelivery", openCloudStatus: null };
+    discardBody(upstream);
     const wait = 400 * 2 ** attempt;
     log(`[proxy] HTTP ${upstream.status} ${url.slice(0, 160)} – Retry in ${wait} ms (${attempt + 1}/2)`);
     await sleep(wait);
   }
   // Nicht erreichbar: alle Pfade oben enden in `return`.
-  return { upstream: null, via: "assetdelivery" };
+  return { upstream: null, via: "assetdelivery", openCloudStatus: null };
 }
 
 app.get("/roblox-proxy", async (request, response) => {
@@ -397,7 +538,22 @@ app.get("/roblox-proxy", async (request, response) => {
     headerTimer = null;
     if (!upstream || !upstream.ok || !upstream.body) {
       log(`[proxy] HTTP ${upstream?.status ?? "?"} ${url.slice(0, 220)}`);
-      return response.status(upstream?.status ?? 502).end();
+      const status = upstream?.status ?? 502;
+      if (!upstream?.body) return response.status(status).end();
+      // Fehler-Bodies (z. B. Roblox „Authentication required to access Asset.“)
+      // durchreichen: Der Browser-Guard protokolliert den HTTP-Status, Logs und
+      // Diagnose sehen sonst nur eine leere Antwort.
+      response.status(status);
+      const errorType = upstream.headers.get("content-type");
+      if (errorType) response.setHeader("content-type", errorType);
+      streamTimer = setTimeout(() => controller.abort(), 10_000);
+      try {
+        await pipeline(upstream.body, response);
+      } catch {
+        if (!response.headersSent) response.status(502).end();
+        else response.destroy();
+      }
+      return;
     }
 
     const declaredSize = Number(upstream.headers.get("content-length") || 0);
@@ -477,6 +633,9 @@ function logRenderFailure(userId, state, pageError, consoleErrors, failedRequest
 async function renderAvatar(userId, onProgress) {
   let browser;
   const startedAt = Date.now();
+  // Key-Diagnose auffrischen, bevor der Render läuft – das Ergebnis steht der
+  // Discord-Antwort zur Verfügung, wenn der Render fertig ist.
+  refreshOpenCloudProbeIfNeeded("render");
   const elapsed = () => `+${Math.round((Date.now() - startedAt) / 1000)} s`;
   let lastPhase = "";
   let lastMessage = "";
@@ -607,14 +766,18 @@ async function renderAvatar(userId, onProgress) {
       const png = await canvas.screenshot({ type: "png", optimizeForSpeed: true });
       log(`[render] userId=${userId}: PNG erzeugt, ${(png.length / 1024).toFixed(0)} KB (${elapsed()}).`);
       const skippedAssets = Array.isArray(state?.skippedAssets) ? state.skippedAssets : [];
+      const skippedAssetDetails = Array.isArray(state?.skippedAssetDetails) ? state.skippedAssetDetails : [];
       if (skippedAssets.length) {
-        log(`[render] userId=${userId}: ${skippedAssets.length} Asset(s) übersprungen: ${skippedAssets.slice(0, 12).join(", ")}`);
+        const reasons = skippedAssetDetails.length
+          ? ` (${skippedAssetDetails.slice(0, 12).map((entry) => `${entry.id}: ${entry.reason}`).join(", ")})`
+          : "";
+        log(`[render] userId=${userId}: ${skippedAssets.length} Asset(s) übersprungen: ${skippedAssets.slice(0, 12).join(", ")}${reasons}`);
       }
       const skippedRenderInstances = Array.isArray(state?.skippedRenderInstances) ? state.skippedRenderInstances : [];
       if (skippedRenderInstances.length) {
         log(`[render] userId=${userId}: Degraded-Render – ${skippedRenderInstances.length} blockierende Instanz(en) übersprungen: ${skippedRenderInstances.slice(0, 12).join(", ")}`);
       }
-      return { png, skippedAssets, skippedRenderInstances };
+      return { png, skippedAssets, skippedAssetDetails, skippedRenderInstances };
     } finally {
       clearInterval(progressTimer);
     }
@@ -637,8 +800,8 @@ app.get("/render-debug", async (request, response) => {
   busy = true;
   activeJob = `debug:${userId}`;
   try {
-    const { png, skippedAssets, skippedRenderInstances } = await renderAvatar(userId, () => {});
-    response.json({ ok: true, userId, bytes: png.length, skippedAssets, skippedRenderInstances, build: getBuildInfo() });
+    const { png, skippedAssets, skippedAssetDetails, skippedRenderInstances } = await renderAvatar(userId, () => {});
+    response.json({ ok: true, userId, bytes: png.length, skippedAssets, skippedAssetDetails, skippedRenderInstances, openCloud: openCloudProbeSnapshot(), build: getBuildInfo() });
   } catch (error) {
     response.status(500).json({
       ok: false,
@@ -710,7 +873,7 @@ async function handleRender(interaction) {
     }
     update("Avatar-Daten wurden gefunden. Render wird vorbereitet …", true);
 
-    const { png, skippedAssets, skippedRenderInstances } = await renderAvatar(activeJobUser.id, (_phase, message) => update(message));
+    const { png, skippedAssets, skippedAssetDetails, skippedRenderInstances } = await renderAvatar(activeJobUser.id, (_phase, message) => update(message));
     clearInterval(heartbeat);
     heartbeat = undefined;
     await editChain;
@@ -727,11 +890,29 @@ async function handleRender(interaction) {
         { name: "Dauer", value: `${Math.floor((Date.now() - startedAt) / 1000)} s`, inline: true },
       );
     if (skippedAssets?.length) {
-      const list = skippedAssets.slice(0, 8).map((id) => `rbxassetid://${id}`).join(", ");
+      const reasons = new Map(
+        (skippedAssetDetails || []).map((entry) => [String(entry.id), String(entry.reason || "").slice(0, 60)]),
+      );
+      const list = skippedAssets.slice(0, 8)
+        .map((id) => `rbxassetid://${id}${reasons.get(String(id)) ? ` (${reasons.get(String(id))})` : ""}`)
+        .join(", ");
       const more = skippedAssets.length > 8 ? ` (+${skippedAssets.length - 8} weitere)` : "";
+      // Unterscheidet „Key fehlt“ von „Key gesetzt, aber von Roblox abgelehnt“
+      // von „Key aktiv, Assets trotzdem fehlgeschlagen“ – vorher stand hier immer
+      // derselbe statische Hinweis, selbst wenn der Key längst konfiguriert war.
+      let hint;
+      if (!config.openCloudApiKey) {
+        hint = "Roblox liefert diese Assets ohne Authentifizierung nicht mehr (HTTP 401 seit April 2025). Setze `ROBLOX_OPENCLOUD_API_KEY` (User-Key mit Scope `legacy-asset:manage`), dann werden sie über die OpenCloud Asset-Delivery-API nachgeladen.";
+      } else if (openCloudState.probeStatus === "rejected") {
+        hint = `Der OpenCloud-API-Key ist zwar gesetzt, wird von Roblox aber ABGELEHNT (HTTP ${openCloudState.probeHttp ?? "?"}${openCloudState.probeMessage ? `: ${openCloudState.probeMessage.slice(0, 90)}` : ""}). Der Key muss als User-Key mit Scope \`legacy-asset:manage\` angelegt sein (https://create.roblox.com/dashboard/credentials) – danach neu deployen. Details: /health unter openCloud.probe.`;
+      } else if (openCloudState.probeStatus === "ok") {
+        hint = "OpenCloud-Key ist aktiv und wurde von Roblox akzeptiert – diese Assets sind trotzdem fehlgeschlagen (Grund in Klammern, Details in den Server-Logs).";
+      } else {
+        hint = "OpenCloud-Key ist gesetzt. Prüfe /health (openCloud.probe) und die Server-Logs, warum die Nachladung dieser Assets fehlschlug.";
+      }
       doneEmbed.addFields({
         name: `⚠️ ${skippedAssets.length} Asset(s) übersprungen`,
-        value: `Roblox liefert diese Assets ohne Authentifizierung nicht mehr (HTTP 401 seit April 2025). ${list}${more}. Mit \`ROBLOX_OPENCLOUD_API_KEY\` werden sie nachgeladen.`,
+        value: `${hint}\n${list}${more}`,
       });
     }
     if (skippedRenderInstances?.length) {
@@ -1031,6 +1212,10 @@ const server = app.listen(config.port, "0.0.0.0", () => {
   log(`[http] HTTP: Port ${config.port} (Healthcheck: /health).`);
   log(`[startup] Build ${build.id} git=${build.gitCommit} branch=${build.gitBranch} node=${build.node}.`);
   log(`[startup] OpenCloud API-Key: ${config.openCloudApiKey ? "konfiguriert" : "nicht konfiguriert"}.`);
+  if (config.openCloudApiKey) {
+    void probeOpenCloudApiKey("startup");
+    setInterval(() => void probeOpenCloudApiKey("interval"), 15 * 60 * 1000).unref();
+  }
   if (config.skipDiscord) {
     botState.status = "skipped";
     log("[startup] SKIP_DISCORD=true – Discord-Login übersprungen, Render-Pfad bleibt aktiv.");

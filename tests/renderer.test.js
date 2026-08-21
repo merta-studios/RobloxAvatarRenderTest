@@ -177,6 +177,15 @@ test("Server-Proxy kennt OpenCloud-Location-JSON und Rohcontent-Fallback", () =>
   assert.match(server, /x-api-key/);
   assert.match(server, /config\.openCloudApiKey/);
   assert.match(server, /skippedAssets/);
+  // OpenCloud-Nachladung darf NIE Binärdaten streamen: Die Bibliothek parst
+  // jede assetdelivery/v2-Antwort als JSON-Locations-Envelope (getCDNURLFromAssetDelivery).
+  assert.match(server, /locationsEnvelopeResponse/);
+  assert.match(server, /buildLocationsEnvelope/);
+  assert.match(server, /pickEnvelopeLocation/);
+  assert.match(server, /openCloudAssetDeliveryUrlCandidates/);
+  // Skip-Gründe pro Asset statt statischem Hinweis.
+  assert.match(server, /skippedAssetDetails/);
+  assert.match(server, /openCloudState\.probeStatus/);
 });
 
 test("Server-Proxy leitet nach automatischer undici-Dekompression keine falsche Content-Length weiter", () => {

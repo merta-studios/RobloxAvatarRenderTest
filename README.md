@@ -231,7 +231,7 @@ Der Fehler kommt mit Zusatzinfo, z. B. `… (letzte Phase: „assets“, zuletzt
 - **`profile`** – `avatar.roblox.com` nicht erreichbar oder der User blockiert die Avatar-Auskunft.
 - **`assets`** – Ein Asset-Download hängt oder scheitert (Roblox-Rate-Limit, moderiert/gelöscht, zu groß, **UGC ohne Authentifizierung**). Der Renderer überspringt einzelne fehlgeschlagene Assets inzwischen und rendert den Rest weiter (Hinweis in der Discord-Antwort); die Fehlermeldung `Mindestens ein Avatar-Asset konnte nicht verarbeitet werden.` (Fehlerstufe `rig`/`humanoidDescription`/`renderDesc`) bleibt nur für Fehler, die den Avatar selbst betreffen. Der Fortschritts-Watchdog (240 s) und die Pro-Asset-Deadline (150 s) sorgen dafür, dass die alte „Kein Fortschritt … (zuletzt geladen: getAssetBufferInternal-rbxassetid://123…)“-Hänger nicht mehr auftreten.
 - **„Kein Fortschritt … in Phase „assets“ ohne „Zuletzt geladen:“** – Zeigt die EMPTY-Label-Variante des Hängers: Die Downloads waren längst fertig, aber ein interner Promise-Pfad der Bibliothek hat nie aufgelöst (`roavatar-renderer` 1.6.2 verwendet `.then(resolve)`-Ketten ohne Rejection-Handler). Die konkrete Root Cause des 200-s-Stalls war der Render-Compile-Pfad: `RBXRenderer._addRenderDesc` hängt an `compileResults(...).then(...)` **ohne** `.catch` – rejected oder hängt `compileResults` (Throw beim Mesh-/Textur-Verarbeiten), bleibt der Descriptor für immer „weder compiled noch failed“, `onRenderSuccess` feuert nie, und das reine Event-Nachspielen konnte nichts feuern. Dagegen liegen jetzt diese Schichten: 1. `guardGetRBX`/`guardGetAssetBuffer` (Rejection/Deadline um die Asset-Loader), 2. Runtime-Patches der exportierten Prototype-Klassen (`AnimatorWrapper`, `HumanoidDescriptionWrapper`, `OutfitRenderer._setRigTo` – Throws werden zu „Asset übersprungen“/`onError` statt zu stillen Hängern; kein Eingriff in `node_modules`), 3. `patchRenderDescCompile` (Fehler/Deadline in `compileResults` werden zu „failed“, damit `failedRenderDesc` feuert und nichts ewig pending bleibt), 4. die **deterministische Thumbnail-Zustandsmaschine** (`src/thumbnail-pipeline.js`): sie wartet nicht mehr auf `prepareForThumbnail()`/`onRenderSuccess`, sondern pollt den echten `RenderScene`-Zustand, hat Stufen-Deadlines und entfernt dauerhaft pending/failed Render-Descriptors gezielt (Degraded-Render statt 200-s-Fehler), 5. der Watchdog als letzte Auffanglinie. Schlägt ein Render trotzdem fehl, zeigt die Discord-Antwort unter **Diagnose** Build-ID (erkennt veraltete Deploys), fehlgeschlagene Requests, Console-Fehler und den internen `prepareStage` samt pending Descriptors.
-- **UGC-Assets mit HTTP 401** – Seit April 2025 verlangt Roblox für Asset-Delivery-Endpunkte Authentifizierung; klassische Shirts/Pants und neuere Accessoires (UGC) liefern unauthentifiziert `401 Authentication required to access Asset.` (nur offizielle Roblox-Assets wie Body Parts, Dynamic Heads und Roblox-eigene Accessoires sind noch ausgenommen). Ohne Key werden diese Assets übersprungen (Avatar rendert trotzdem). Für vollständige Renders `ROBLOX_OPENCLOUD_API_KEY` setzen (siehe unten) – der Proxy lädt die Assets dann über die offizielle OpenCloud Asset-Delivery-API (`apis.roblox.com/asset-delivery-api`) nach.
+- **UGC-Assets mit HTTP 401** – Seit April 2025 verlangt Roblox für Asset-Delivery-Endpunkte Authentifizierung; klassische Shirts/Pants und neuere Accessoires (UGC) liefern unauthentifiziert `401 Authentication required to access Asset.` (nur offizielle Roblox-Assets wie Body Parts, Dynamic Heads und Roblox-eigene Accessoires sind noch ausgenommen). Ohne Key werden diese Assets übersprungen (Avatar rendert trotzdem). Mit Key lädt der Proxy sie über die offizielle OpenCloud Asset-Delivery-API (`apis.roblox.com/asset-delivery-api`) nach. **Wichtig für die Fehlersuche:** Die Discord-Antwort nennt pro übersprungenem Asset den konkreten Grund (`HTTP 401`, `Zeitlimit 150 s`, …) und unterscheidet „Key fehlt“ / „Key von Roblox abgelehnt“ / „Key aktiv“; `/health` zeigt unter `openCloud.probe` live, ob der Key funktioniert (`status: "ok"` bzw. `"rejected"` + HTTP-Code). Der Key muss als **User-Key** mit Scope **`legacy-asset:manage`** angelegt sein; nach dem Setzen der Variable muss der Service neu deployt werden.
 - **`finalize`** – Szene war fertig, aber das finale Bild konnte nicht gezeichnet werden (Speicher).
 
 Alle Phasen werden mit Laufzeit geloggt (`[render] userId=… Phase … (+42 s)`), sodass man in den Render-Logs genau sieht, wo die Zeit hingeht. Ergänzend kann es die Fehlermeldung `Chromium ist während des Renders abgestürzt` geben — das ist praktisch immer das Speicherlimit des freien Tarifs.
@@ -272,9 +272,30 @@ Roblox-Cookie – deshalb lädt er Assets auf zwei cookie-freien Wegen:
    Avatar-API liefert zu jedem getragenen Asset die `currentVersionId` mit; der
    Renderer schreibt Asset-Anfragen auf den versionierten Endpunkt
    `assetdelivery.roblox.com/v2/assetId/{id}/version/{version}` um
-   (`src/asset-urls.js`), der ohne Cookie funktioniert. Assets ohne bekannte
-   Version (z. B. Texturen in älteren Katalog-Assets) laufen weiter über den
-   Legacy-Endpunkt, solange Roblox ihn bedient.
+   (`src/asset-urls.js`), der für Roblox-eigene Assets ohne Cookie funktioniert.
+   Assets ohne bekannte Version (z. B. Texturen in RBXM-Dateien) laufen weiter
+   über den unversionierten Endpunkt.
+3. **UGC-Assets über OpenCloud (Key erforderlich):** Community-Assets (UGC-Shirts,
+   -Pants, viele Accessoires) liefert Roblox auch versioniert nur mit
+   Authentifizierung aus. Mit `ROBLOX_OPENCLOUD_API_KEY` (User-Key, Scope
+   `legacy-asset:manage`) fragt der Proxy diese Assets bei
+   `apis.roblox.com/asset-delivery-api/v1/assetId/{id}` (zuerst versioniert,
+   dann unversioniert) nach.
+
+**Antwort-Contract des Proxys (wichtig):** `roavatar-renderer` erwartet auf
+JEDE `assetdelivery.roblox.com/v2/…`-Antwort eine JSON-Locations-Envelope
+(`{"locations":[{"location":"https://…rbxcdn.com/…"}]}`) und liest
+`data.locations[0].location` (`API.Misc.getCDNURLFromAssetDelivery`). Der Proxy
+liefert deshalb für Asset-Delivery-Anfragen ausnahmslos diese Envelope – auch
+nach der OpenCloud-Nachladung und bei Redirects auf CDN-Binärdaten. Die
+Binärdaten holt sich die Bibliothek danach selbst über die (signierte)
+CDN-Location. Vorher streamte der Proxy nach erfolgreicher OpenCloud-Nachladung
+die rohen Binärdaten; `response.json()` der Bibliothek scheiterte daran in einer
+Promise-Kette ohne `catch`, das Asset löste nie auf und wurde erst durch die
+150-s-Guard-Deadline übersprungen – die Ursache für „Shirt/Hose/Accessoires
+fehlen trotz gültigem API-Key“ bei ~195 s Renderzeit (nachgestellt und durch
+Integrationstests gegen die echte Bibliothek abgesichert:
+`tests/proxy-opencloud.test.js`).
 
 ## Lizenz
 

@@ -100,6 +100,99 @@ export async function inspectOpenCloudAssetResponse(response) {
 }
 
 /**
+ * Liefert alle sinnvollen OpenCloud-Asset-Delivery-URLs für eine
+ * assetdelivery.roblox.com-URL – versioniert zuerst (exakte Version aus der
+ * Avatar-Antwort), danach unversioniert (aktuelle Version, falls Roblox die
+ * Versionsnummer des OpenCloud-Endpunkts nicht akzeptiert).
+ *
+ * @param {string} rawUrl assetdelivery.roblox.com-URL
+ * @returns {string[]} OpenCloud-URLs (eventuell leer)
+ */
+export function openCloudAssetDeliveryUrlCandidates(rawUrl) {
+  const urls = [];
+  const versioned = openCloudAssetDeliveryUrl(rawUrl);
+  if (versioned) urls.push(versioned);
+  const id = (() => {
+    try {
+      const url = new URL(rawUrl);
+      const versionedMatch = /^\/v[12]\/assetId\/(\d+)/.exec(url.pathname);
+      if (versionedMatch) return versionedMatch[1];
+      const idParam = url.searchParams.get("id");
+      return idParam && /^\d+$/.test(idParam) ? idParam : null;
+    } catch { return null; }
+  })();
+  if (id) {
+    const unversioned = `https://apis.roblox.com/asset-delivery-api/v1/assetId/${id}`;
+    if (!urls.includes(unversioned)) urls.push(unversioned);
+  }
+  return urls;
+}
+
+/**
+ * Wählt aus einer Asset-Delivery-Antwort (`{location}` oder `{locations:[…]})`
+ * die Location, die zum angeforderten Asset-Format passt. Die Bibliothek
+ * liest hinterher blind `locations[0].location` – wir bestücken die Envelope
+ * deshalb selbst mit dem besten Kandidaten.
+ *
+ * @param {unknown} json bereits geparste Asset-Delivery-Antwort
+ * @param {string|null} [preferredAssetFormat] Wert des Roblox-AssetFormat-Headers (z. B. "avatar_meshpart_head")
+ * @returns {string|null} Location oder null
+ */
+export function pickEnvelopeLocation(json, preferredAssetFormat = null) {
+  if (!json || typeof json !== "object" || Array.isArray(json)) return null;
+
+  const hasErrorsField = Object.keys(json).some((key) => key.toLowerCase() === "errors");
+  if (hasErrorsField) return null;
+
+  const locationsEntry = Object.entries(json).find(([key]) => key.toLowerCase() === "locations");
+  const locations = Array.isArray(locationsEntry?.[1]) ? locationsEntry[1] : null;
+  if (locations) {
+    const entries = locations
+      .map((item) => {
+        const location = getCaseInsensitiveField(item, "location");
+        const format = getCaseInsensitiveField(item, "assetformat");
+        return typeof location === "string" && location.trim()
+          ? { location: location.trim(), format: typeof format === "string" ? format : null }
+          : null;
+      })
+      .filter(Boolean);
+    if (entries.length) {
+      const preferred = preferredAssetFormat
+        ? entries.find((entry) => entry.format === preferredAssetFormat)
+        : null;
+      return (preferred || entries[0]).location;
+    }
+  }
+
+  const direct = getCaseInsensitiveField(json, "location");
+  if (typeof direct === "string" && direct.trim()) return direct.trim();
+  return null;
+}
+
+/**
+ * Baut die JSON-Envelope, die roavatar-renderer (ASSETDELIVERY_V2) von jeder
+ * assetdelivery.roblox.com/v2-URL erwartet:
+ *
+ *   {"locations":[{"assetFormat":"…","location":"https://…rbxcdn.com/…"}]}
+ *
+ * Die Bibliothek ruft auf der Antwort `response.json()` auf und liest
+ * `data.locations[0].location` (getCDNURLFromAssetDelivery). Roh-Binärdaten
+ * lassen diese Promise-Kette OHNE catch scheitern – das Asset lädt dann nie
+ * und wird erst durch unsere Guard-Deadline nach 150 s übersprungen. Der Proxy
+ * darf daher für Asset-Delivery-Anfragen NIE Binärdaten liefern, sondern muss
+ * die Location in dieser Envelope weiterreichen.
+ *
+ * @param {string} location CDN-Location (z. B. https://fts.rbxcdn.com/…?__token__=…)
+ * @param {string|null} [assetFormat] bekanntes Format der Location, sonst "source"
+ * @returns {object} serialisierbare Envelope für response.json()
+ */
+export function buildLocationsEnvelope(location, assetFormat = null) {
+  return {
+    locations: [{ assetFormat: assetFormat || "source", location }],
+  };
+}
+
+/**
  * Leitet eine assetdelivery.roblox.com-URL auf die offizielle OpenCloud
  * Asset-Delivery-API um (https://apis.roblox.com/asset-delivery-api/v1/…).
  * Die OpenCloud-Endpunkte sind seit April 2025 der einzige Weg, UGC-Assets
