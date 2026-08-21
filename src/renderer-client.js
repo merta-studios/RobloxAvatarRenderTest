@@ -2,6 +2,7 @@ import {
   API,
   AnimatorWrapper,
   Authentication,
+  AvatarType,
   FLAGS,
   HumanoidDescriptionWrapper,
   Outfit,
@@ -12,8 +13,13 @@ import {
 import { BUILD_ID } from "./build-info.js";
 import { createAssetVersionMap, recordAssetVersions, rewriteAssetDeliveryUrl } from "./asset-urls.js";
 import { extractAssetIdFromUrl, guardGetAssetBuffer, guardGetMesh, guardGetRBX } from "./asset-loader-guard.js";
-import { patchAnimatorWrapper, patchHumanoidDescriptionApply, patchOutfitRenderer } from "./library-guards.js";
-import { withStallDeadline } from "./render-deadline.js";
+import {
+  patchAnimatorWrapper,
+  patchHumanoidDescriptionApply,
+  patchOutfitRendererRigLoad,
+  patchRenderDescCompile,
+} from "./library-guards.js";
+import { createThumbnailPipeline } from "./thumbnail-pipeline.js";
 import { createFetchWithTimeout } from "./fetch-timeout.js";
 import "./renderer.css";
 
@@ -32,12 +38,17 @@ const ASSET_LOAD_DEADLINE_MS = 150_000;
 // GetRBX = Download (max. ASSET_LOAD_DEADLINE_MS) + RBXM-Parsing: etwas mehr
 // Luft, dann wird das Asset übersprungen statt den Render zu blockieren.
 const GET_RBX_DEADLINE_MS = 190_000;
-// prepareForThumbnail darf beliebig lange laufen, SOLANGE noch Fortschritt zu
-// sehen ist (Labels bewegen sich). Stillstand wird nach 200 s abgebrochen –
-// unter dem 240-s-Watchdog, damit die konkrete Meldung gewinnt. Flache Grenze
-// knapp unter dem globalen Render-Timeout (420 s).
-const PREPARE_STALL_LIMIT_MS = 200_000;
-const PREPARE_FLAT_LIMIT_MS = 400_000;
+// Pro-Render-Descriptor-Deadline (compileResults): Fehler/Timeout werden zu
+// „failed“ statt zu einem ewig pending Descriptor ohne jedes Event.
+const COMPILE_STEP_DEADLINE_MS = 150_000;
+// Stufen-Budgets der Thumbnail-Zustandsmaschine (Summe < Render-Timeout 420 s).
+// Kein flaches Warten auf prepareForThumbnail-Events mehr: Jede Stufe pollt
+// überprüfbaren Objektzustand und hat eine eigene, nachvollziehbare Deadline.
+const OUTFIT_STAGE_LIMIT_MS = 210_000;   // Instance-Tree (Downloads + applyDescription)
+const POSE_STAGE_LIMIT_MS = 30_000;      // setMainAnimation + Pose-Frames
+const COMPILE_STAGE_LIMIT_MS = 120_000;  // Render-Kompilierung inkl. Skip-Loop
+const DESC_STALL_LIMIT_MS = 30_000;      // ohne Compile-Fortschritt: nächsten Blockierer überspringen
+const PREPARE_TOTAL_LIMIT_MS = 395_000;  // flaches Gesamtlimit der Vorbereitung
 
 const state = window.__renderState = {
   phase: "idle",
@@ -48,6 +59,13 @@ const state = window.__renderState = {
   // Assets, die nicht geladen werden konnten und deshalb übersprungen wurden
   // (z. B. UGC mit HTTP 401 – Roblox verlangt dafür seit April 2025 Authentifizierung).
   skippedAssets: [],
+  // Interne Diagnose der Thumbnail-Zustandsmaschine: konkreter Teilschritt statt
+  // nur „assets“, damit ein Stall nie wieder als leeres `assets|`-Signal endet.
+  prepareStage: null,
+  prepare: null,
+  // Render-Descriptors/Instanzen, die dauerhaft pending/failed waren und
+  // übersprungen wurden (der Rest-Avatar wird trotzdem gerendert).
+  skippedRenderInstances: [],
   buildId: BUILD_ID,
   updatedAt: Date.now(),
 };
@@ -76,10 +94,34 @@ function currentLabels() {
   }
 }
 
+/** Aktive Thumbnail-Zustandsmaschine (null außerhalb der Asset-Phase). */
+let activePipeline = null;
+
+function mergePrepareDiagnostics(snapshot) {
+  if (!snapshot) return;
+  state.prepareStage = snapshot.stage;
+  state.prepare = {
+    stageElapsedMs: snapshot.stageElapsedMs,
+    totalElapsedMs: snapshot.totalElapsedMs,
+    hasCurrentRig: snapshot.hasCurrentRig,
+    currentlyUpdating: snapshot.currentlyUpdating,
+    currentlyChangingRig: snapshot.currentlyChangingRig,
+    hasNewUpdate: snapshot.hasNewUpdate,
+    hasFiredFullyRendered: snapshot.hasFiredFullyRendered,
+    rigDescendantCount: snapshot.rigDescendantCount,
+    descriptors: snapshot.descriptors,
+    pendingInstances: snapshot.pendingInstances,
+    skippedInstances: snapshot.skippedInstances,
+    pose: snapshot.pose,
+  };
+  state.updatedAt = Date.now();
+}
+
 /**
  * Watchdog: schlägt Alarm, wenn sich weder die Phase noch die Liste der
- * geladenen Assets bewegt. Macht aus „hängt still bis zum globalen Timeout“
- * einen konkreten Fehler mit Phase und letztem Asset.
+ * geladenen Assets noch die interne Vorbereitungs-Stufe bewegt. Macht aus
+ * „hängt still bis zum globalen Timeout“ einen konkreten Fehler mit Phase,
+ * Teilschritt und pending Render-Descriptors.
  */
 let lastSignature = "";
 let lastMovementAt = Date.now();
@@ -89,7 +131,14 @@ const watchdog = setInterval(() => {
     return;
   }
   state.assetLabels = currentLabels();
-  const signature = `${state.phase}|${state.assetLabels.join("|")}`;
+  if (activePipeline) {
+    try { mergePrepareDiagnostics(activePipeline.snapshot()); } catch { /* Diagnose ist optional */ }
+  }
+  const prepare = state.prepare;
+  const prepareSig = prepare
+    ? `${state.prepareStage}|d=${prepare.descriptors?.compiled ?? "?"}/${prepare.descriptors?.total ?? "?"}|p=${prepare.descriptors?.pending ?? "?"}|s=${(prepare.skippedInstances || []).length}`
+    : "";
+  const signature = `${state.phase}|${state.assetLabels.join("|")}|${prepareSig}`;
   if (signature !== lastSignature) {
     lastSignature = signature;
     lastMovementAt = Date.now();
@@ -99,7 +148,13 @@ const watchdog = setInterval(() => {
   if (stalledFor >= STALL_LIMIT_MS) {
     const recent = state.assetLabels.slice(-2);
     const detail = recent.length ? ` Zuletzt geladen: ${recent.join(", ")}.` : "";
-    state.error = `Kein Fortschritt seit ${Math.round(stalledFor / 1000)} s in Phase „${state.phase}“.${detail}`;
+    const stageDetail = prepare
+      ? ` Teilschritt: „${state.prepareStage}“ seit ${Math.round((prepare.stageElapsedMs || 0) / 1000)} s;`
+        + ` Descriptors compiled/pending/failed: ${prepare.descriptors?.compiled}/${prepare.descriptors?.pending}/${prepare.descriptors?.failed};`
+        + ` pending zuletzt: ${(prepare.pendingInstances || []).slice(0, 3).join(", ") || "–"};`
+        + ` übersprungene Instanzen: ${(prepare.skippedInstances || []).slice(0, 3).join(", ") || "–"}.`
+      : "";
+    state.error = `Kein Fortschritt seit ${Math.round(stalledFor / 1000)} s in Phase „${state.phase}“.${stageDetail}${detail}`;
     state.done = true;
     report("error", state.error);
   }
@@ -215,12 +270,30 @@ patchHumanoidDescriptionApply(HumanoidDescriptionWrapper, {
     console.warn(`[guard] HumanoidDescription.${method} übersprungen: ${error?.message || error}`);
   },
 });
-// roavatar-renderer 1.6.2 kann onSuccess/onRenderSuccess synchron feuern, kurz
-// bevor prepareForThumbnail seinen Listener verbindet. Das erklärt den
-// beobachteten Stillstand mit leerem Fortschrittssignal `assets|` trotz bereits
-// abgeschlossener Downloads. Der Patch spielt ausschließlich verpasste,
-// anhand des Objektzustands bestätigte Signale nach.
-patchOutfitRenderer(OutfitRenderer);
+// _setRigTo: eigenes new Promise(resolve) mit GetRBX(...).then(...) OHNE
+// Rejection-Handler; ein Throw in generateTree/GetChildren ließ das Promise
+// für immer pending (keinerlei Event, leeres Fortschrittssignal). Mit Patch
+// wird daraus onError("rig") + Auflösung.
+patchOutfitRendererRigLoad(OutfitRenderer, {
+  getRBX: (url, headers) => API.Asset.GetRBX(url, headers),
+  addInstance: (instance, auth, renderScene) => RBXRenderer.addInstance(instance, auth, renderScene),
+  onSkipped: ({ method, error }) => {
+    console.warn(`[guard] Rig-Laden: ${method} fehlgeschlagen: ${error?.message || error}`);
+  },
+});
+// Render-Compile-Pfad: _addRenderDesc hängt an compileResults(...).then(...)
+// OHNE catch. Ein Reject/Throw/Hänger dort ließ den Descriptor für immer
+// „weder compiled noch failed“ bleiben – onRenderSuccess feuerte nie (das
+// beobachtete `assets|`-Stall-Signal). Mit Patch werden Fehler/Deadline zu
+// „failed“ (failedRenderDesc feuert), und die Zustandsmaschine überspringt
+// den einzelnen Descriptor gezielt.
+patchRenderDescCompile(RBXRenderer, {
+  compileDeadlineMs: COMPILE_STEP_DEADLINE_MS,
+  onFailed: ({ label, reason, error }) => {
+    console.warn(`[guard] Render-Descriptor ${reason}: ${label}${error?.message ? ` (${error.message})` : ""}`);
+  },
+  stopLoadingLabel: (label) => API.Misc.stopCurrentlyLoadingAssets(label),
+});
 
 /**
  * Die Rig-URLs (`roavatar://RigR15.rbxm` / `RigR6`) löst die Bibliothek über
@@ -312,6 +385,8 @@ async function render(userId) {
   // Auf SwiftShader (Software-Rendering, ~0,1 CPU) frisst so ein Dauer-Loop fast
   // die gesamte CPU — Downloads und Mesh-Parsing verhungern und der Render läuft
   // in jedes Zeitlimit. Stattdessen wird am Ende genau ein Frame gezeichnet.
+  // Render-Kompilierung läuft Promise-basiert und braucht keinen Frame-Tick;
+  // der finale Frame folgt nach der Compile-Phase (unten).
   const setupSucceeded = await RBXRenderer.fullSetup(true, true, false);
   if (!setupSucceeded) throw new Error("WebGL-Renderer konnte nicht gestartet werden.");
 
@@ -338,21 +413,46 @@ async function render(userId) {
   outfitRenderer.onRenderError.Connect(() => {
     assetFailure = assetFailure || "renderDesc";
   });
-  const succeeded = await withStallDeadline(outfitRenderer.prepareForThumbnail(), {
-    stallMs: PREPARE_STALL_LIMIT_MS,
-    flatMs: PREPARE_FLAT_LIMIT_MS,
-    getProgressSignature: () => `${state.phase}|${currentLabels().join("|")}`,
-    buildError: ({ reason, stalledMs, signature }) => new Error(
-      reason === "stall"
-        ? `Avatar-Zusammenbau hat ${Math.round(stalledMs / 1000)} s lang keinen Fortschritt gemacht (Phase „${state.phase}“${signature ? `, letztes Signal: ${signature.slice(0, 96)}` : ", keine Assets in Bearbeitung"}). Vermutlich hängt ein interner Bibliotheks-Pfad – Details stehen in den Server-Logs.`
-        : `Avatar-Zusammenbau hat das Zeitlimit von ${Math.round(PREPARE_FLAT_LIMIT_MS / 1000)} s überschritten (Phase „${state.phase}“).`,
-    ),
+
+  // NEU (Nachfolger des Event-Replay-Patches): prepareForThumbnail() wird NICHT
+  // mehr abgewartet. Dessen zweiter Wartepunkt (onRenderSuccess) feuert nie,
+  // wenn ein Render-Descriptor dauerhaft pending bleibt – exakt der
+  // Produktions-Stall `assets|`. Stattdessen: eigene, nachvollziehbare
+  // Zustandsmaschine mit Stufen-Deadlines, Compile-Polling am echten
+  // RenderScene-Zustand und gezieltem Überspringen defekter Instanzen.
+  const pipeline = createThumbnailPipeline({
+    outfitRenderer,
+    renderScene: outfitRenderer.renderScene,
+    addInstance: (instance, pipelineAuth, renderScene) => RBXRenderer.addInstance(instance, pipelineAuth, renderScene),
+    removeInstance: (instance, renderScene) => RBXRenderer.removeInstance(instance, renderScene),
+    isR6: outfit.playerAvatarType === AvatarType.R6,
+    onDiagnostics: mergePrepareDiagnostics,
+  }, {
+    outfitDeadlineMs: OUTFIT_STAGE_LIMIT_MS,
+    poseDeadlineMs: POSE_STAGE_LIMIT_MS,
+    compileDeadlineMs: COMPILE_STAGE_LIMIT_MS,
+    descStallMs: DESC_STALL_LIMIT_MS,
+    totalDeadlineMs: PREPARE_TOTAL_LIMIT_MS,
   });
-  if (!succeeded) {
+  activePipeline = pipeline;
+
+  let prepareResult;
+  try {
+    prepareResult = await pipeline.run();
+  } catch (error) {
     const detail = assetFailure
-      ? `Fehlerstufe: ${assetFailure} – ${describeAssetFailure(assetFailure)}`
-      : "Ursache unbekannt";
-    throw new Error(`Mindestens ein Avatar-Asset konnte nicht verarbeitet werden. ${detail}`);
+      ? ` Fehlerstufe: ${assetFailure} – ${describeAssetFailure(assetFailure)}`
+      : "";
+    throw new Error(`Avatar-Vorbereitung fehlgeschlagen: ${error?.message || error}.${detail}`);
+  } finally {
+    pipeline.dispose();
+    activePipeline = null;
+  }
+
+  if (prepareResult.status === "degraded") {
+    const labels = prepareResult.skipped.map((entry) => entry.label).slice(0, 8);
+    console.warn(`[render] Degraded-Render (${prepareResult.reason}): ${prepareResult.skipped.length} Instanz(en) übersprungen: ${labels.join(", ") || "–"}`);
+    state.skippedRenderInstances = prepareResult.skipped.map((entry) => entry.label);
   }
 
   report("finalize", "Materialien, Pose, Licht und Kamera werden finalisiert …");

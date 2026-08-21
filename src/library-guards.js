@@ -206,3 +206,161 @@ export function patchOutfitRenderer(OutfitRendererClass) {
   Object.defineProperty(proto, flag, { value: true, enumerable: false, configurable: true });
   return true;
 }
+
+/**
+ * Entschärft `OutfitRenderer.prototype._setRigTo` (roavatar-renderer 1.6.2):
+ * Das Original baut `new Promise((resolve) => … GetRBX(...).then(...))` OHNE
+ * Rejection-Handler; ein Throw in `generateTree()`/`GetChildren()` (z. B. ein
+ * ungewöhnliches Rig-Format) lässt den `.then`-Callback werfen → das äußere
+ * Promise wird NIE aufgelöst, `currentlyUpdating` bleibt dauerhaft true, und
+ * kein `onSuccess`/`onError` feuert. Mit Patch werden alle Fehlerpfade zu
+ * `onError.Fire("rig")` + Auflösen übersetzt, damit die Thumbnail-Zustands-
+ * maschine eine konkrete Fehlerstufe melden kann.
+ *
+ * @template {{ prototype: object }} OutfitRendererClass
+ * @param {OutfitRendererClass} OutfitRendererClass die exportierte Klasse
+ * @param {{
+ *   getRBX: (url: string, headers?: unknown) => Promise<unknown>,
+ *   addInstance?: (instance: object, auth: unknown, renderScene: object) => void,
+ *   onSkipped?: (info: { method: string, error: unknown }) => void,
+ * }} options
+ * @returns {boolean} true, wenn ein Patch durchgeführt wurde
+ */
+export function patchOutfitRendererRigLoad(OutfitRendererClass, options) {
+  const { getRBX, addInstance = () => {}, onSkipped = () => {} } = options || {};
+  const proto = OutfitRendererClass?.prototype;
+  const flag = "__avatarRenderRigLoadGuarded";
+  if (!proto || proto[flag] || typeof getRBX !== "function") return false;
+
+  proto._setRigTo = function guardedSetRigTo(newRigType) {
+    return new Promise((resolve) => {
+      // Original lässt hier das Promise für immer pending – bei uns gibt es
+      // immer eine Auflösung, damit Promise.all in _updateOutfit weiterläuft.
+      if (this.currentlyChangingRig) {
+        resolve(undefined);
+        return;
+      }
+      this.currentlyChangingRig = true;
+      if (this.currentRig) {
+        try {
+          this.currentRig.Destroy();
+        } catch (error) {
+          onSkipped({ method: "_setRigTo.destroyOldRig", error });
+        }
+        this.currentRig = void 0;
+      }
+      this.currentRigType = newRigType;
+      const failToRigError = (method, error) => {
+        onSkipped({ method, error });
+        this.currentlyChangingRig = false;
+        try {
+          this.onError?.Fire?.("rig");
+        } catch { /* Event-API weicht ab */ }
+        resolve(undefined);
+      };
+      Promise.resolve()
+        .then(() => getRBX(`roavatar://Rig${this.currentRigType}.rbxm`, void 0))
+        .then((result) => {
+          // Duck-Type statt `instanceof RBX`: die RBX-Klasse ist hier nicht importierbar.
+          if (result && typeof result.generateTree === "function") {
+            try {
+              const dataModel = result.generateTree();
+              const newRig = dataModel.GetChildren()[0];
+              newRig.setParent(void 0);
+              dataModel.Destroy();
+              this.currentRig = newRig;
+              this.currentlyChangingRig = false;
+              if (this.doAddInstance) addInstance(this.currentRig, this.auth, this.renderScene);
+              resolve(newRig);
+            } catch (error) {
+              failToRigError("_setRigTo.generateTree", error);
+            }
+          } else {
+            this.currentlyChangingRig = false;
+            try {
+              this.onError?.Fire?.("rig");
+            } catch { /* Event-API weicht ab */ }
+            resolve(result);
+          }
+        })
+        .catch((error) => failToRigError("_setRigTo.getRBX", error));
+    });
+  };
+
+  Object.defineProperty(proto, flag, { value: true, enumerable: false, configurable: true });
+  return true;
+}
+
+/**
+ * Schließt das größte verbleibende Loch im Render-Compile-Pfad von
+ * roavatar-renderer 1.6.2: `RBXRenderer._addRenderDesc` hängt an
+ * `newDesc.compileResults(...).then((results) => …)` OHNE `.catch`.
+ *  - Rejected `compileResults` (Throw beim Mesh-/Textur-Verarbeiten), bleibt
+ *    der Descriptor für immer „weder compiled noch failed“ – `onRenderSuccess`
+ *    feuert nie, `failedRenderDesc`/`onRenderError` ebenso wenig.
+ *  - Hängt `compileResults` (Promise ohne Auflösung), gilt dasselbe.
+ *
+ * Der Patch ummantelt `compileResults` jeder Descriptor-Klasse beim ersten
+ * Auftauchen (lazy, idempotent über die Descriptor-Prototype): Fehler und
+ * Deadline werden zu einer nicht-ok `Response` – genau das wertet die
+ * Bibliothek als „failed“ (`desc.failed = true` + `failedRenderDesc.Fire`),
+ * und die Thumbnail-Zustandsmaschine kann den einzelnen Descriptor gezielt
+ * überspringen, statt den ganzen Render 200 s hängen zu lassen.
+ *
+ * @param {{ _addRenderDesc?: Function }} RBXRendererClass die exportierte RBXRenderer-Klasse
+ * @param {{
+ *   compileDeadlineMs?: number,
+ *   onFailed?: (info: { instance: object | undefined, label: string, reason: "compile-error" | "compile-deadline", error?: unknown }) => void,
+ *   stopLoadingLabel?: (label: string) => void,
+ * }} [options]
+ * @returns {boolean} true, wenn ein Patch durchgeführt wurde
+ */
+export function patchRenderDescCompile(RBXRendererClass, options = {}) {
+  const { compileDeadlineMs = 150_000, onFailed = () => {}, stopLoadingLabel = null } = options;
+  const originalAddRenderDesc = RBXRendererClass?._addRenderDesc;
+  const flag = "__avatarRenderCompileGuarded";
+  if (typeof originalAddRenderDesc !== "function" || RBXRendererClass[flag]) return false;
+
+  const labelOf = (desc) => {
+    const instance = desc?.instance;
+    try {
+      if (instance?.GetFullName) return String(instance.GetFullName());
+      if (instance?.className) return String(instance.className);
+    } catch { /* Label ist reine Diagnose */ }
+    return "unknown";
+  };
+
+  RBXRendererClass._addRenderDesc = function guardedAddRenderDesc(instance, auth, DescClass, renderScene) {
+    const proto = DescClass?.prototype;
+    if (proto && !proto[flag] && typeof proto.compileResults === "function") {
+      const originalCompile = proto.compileResults;
+      proto.compileResults = function guardedCompileResults(...args) {
+        let timer;
+        const deadline = new Promise((resolve) => {
+          timer = setTimeout(() => {
+            const label = labelOf(this);
+            onFailed({ instance: this.instance, label, reason: "compile-deadline" });
+            // Die Bibliothek räumt das Loading-Label nur im finally ihres
+            // compileResults ab – hängt das weiter, entfernen wir es selbst.
+            if (typeof stopLoadingLabel === "function") {
+              try { stopLoadingLabel(label); } catch { /* Label evtl. schon weg */ }
+            }
+            resolve(new Response(`Render-Kompilierung hat ${Math.round(compileDeadlineMs / 1000)} s überschritten`, { status: 502 }));
+          }, compileDeadlineMs);
+        });
+        const outcome = Promise.resolve()
+          .then(() => originalCompile.apply(this, args))
+          .catch((error) => {
+            onFailed({ instance: this.instance, label: labelOf(this), reason: "compile-error", error });
+            return new Response("Render-Kompilierung fehlgeschlagen", { status: 502 });
+          });
+        return Promise.race([outcome, deadline]).finally(() => clearTimeout(timer));
+      };
+      Object.defineProperty(proto, flag, { value: true, enumerable: false, configurable: true });
+    }
+    return originalAddRenderDesc.call(this, instance, auth, DescClass, renderScene);
+  };
+
+  Object.defineProperty(RBXRendererClass, flag, { value: true, enumerable: false, configurable: true });
+  return true;
+}

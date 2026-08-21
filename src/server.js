@@ -357,11 +357,37 @@ app.get("/roblox-proxy", async (request, response) => {
 app.use(express.static("dist", { index: "index.html", maxAge: "1h" }));
 app.get("/render", (_request, response) => response.sendFile("index.html", { root: "dist" }));
 
+function describePrepareDiagnostics(state) {
+  const prepare = state?.prepare;
+  if (!prepare) return null;
+  const desc = prepare.descriptors || {};
+  return {
+    stage: state?.prepareStage || null,
+    stageElapsedMs: prepare.stageElapsedMs ?? null,
+    hasCurrentRig: prepare.hasCurrentRig ?? null,
+    currentlyUpdating: prepare.currentlyUpdating ?? null,
+    currentlyChangingRig: prepare.currentlyChangingRig ?? null,
+    hasFiredFullyRendered: prepare.hasFiredFullyRendered ?? null,
+    rigDescendantCount: prepare.rigDescendantCount ?? null,
+    descriptors: { total: desc.total ?? 0, compiled: desc.compiled ?? 0, pending: desc.pending ?? 0, failed: desc.failed ?? 0 },
+    pendingInstances: (prepare.pendingInstances || []).slice(-6),
+    skippedInstances: (prepare.skippedInstances || []).slice(-12),
+  };
+}
+
 function logRenderFailure(userId, state, pageError, consoleErrors, failedRequests, httpErrors) {
   const phase = state?.phase || "unbekannt";
   const labels = state?.assetLabels || [];
   logError(`[render] userId=${userId}: Fehler in Phase ${phase}: ${state?.error || "unbekannt"}`);
   logError(`[render] userId=${userId}: assetLabels=${JSON.stringify(labels.slice(-12))}`);
+  const prepareDiagnostics = describePrepareDiagnostics(state);
+  if (prepareDiagnostics) {
+    logError(`[render] userId=${userId}: prepareStage=${prepareDiagnostics.stage} (seit ${Math.round((prepareDiagnostics.stageElapsedMs ?? 0) / 1000)} s), `
+      + `rig=${prepareDiagnostics.hasCurrentRig}, descendants=${prepareDiagnostics.rigDescendantCount}, `
+      + `updating=${prepareDiagnostics.currentlyUpdating}, changingRig=${prepareDiagnostics.currentlyChangingRig}, `
+      + `fullyRendered=${prepareDiagnostics.hasFiredFullyRendered}, descriptors=${JSON.stringify(prepareDiagnostics.descriptors)}`);
+    logError(`[render] userId=${userId}: pendingInstances=${JSON.stringify(prepareDiagnostics.pendingInstances)} skippedInstances=${JSON.stringify(prepareDiagnostics.skippedInstances)}`);
+  }
   if (pageError) logError(`[render] userId=${userId}: pageError=${pageError}`);
   if (consoleErrors.length) logError(`[render] userId=${userId}: console=${consoleErrors.slice(-20).join(" | ")}`);
   if (failedRequests.length) logError(`[render] userId=${userId}: requestfailed=${failedRequests.slice(-20).join(" | ")}`);
@@ -439,6 +465,7 @@ async function renderAvatar(userId, onProgress) {
     });
     log(`[render] userId=${userId}: Chromium gestartet und Renderer-Seite geladen (${elapsed()}).`);
 
+    let lastPrepareStage = "";
     const progressTimer = setInterval(async () => {
       try {
         const state = await page.evaluate(() => window.__renderState);
@@ -448,6 +475,15 @@ async function renderAvatar(userId, onProgress) {
           lastPhase = state.phase;
           log(`[render] userId=${userId}: Phase ${state.phase} – ${state.message || "–"} (${elapsed()})`);
           onProgress(state.phase, state.message);
+        }
+        // Interne Teilschritte der Thumbnail-Vorbereitung mitloggen, damit ein
+        // Stall nie wieder nur als leeres `assets|`-Signal in den Logs steht.
+        if (state.prepareStage && state.prepareStage !== lastPrepareStage) {
+          lastPrepareStage = state.prepareStage;
+          const desc = state.prepare?.descriptors;
+          log(`[render] userId=${userId}: prepareStage ${state.prepareStage}`
+            + (desc ? ` (Descriptors: ${desc.compiled}/${desc.total} compiled, ${desc.pending} pending, ${desc.failed} failed)` : "")
+            + ` (${elapsed()})`);
         }
       } catch { /* Browser is closing. */ }
     }, 1500);
@@ -478,6 +514,7 @@ async function renderAvatar(userId, onProgress) {
           phase: state.phase,
           message: state.message,
           assetLabels: (state.assetLabels || []).slice(-12),
+          prepare: describePrepareDiagnostics(state),
           pageError,
           consoleErrors: consoleErrors.slice(-20),
           failedRequests: failedRequests.slice(-20),
@@ -495,7 +532,11 @@ async function renderAvatar(userId, onProgress) {
       if (skippedAssets.length) {
         log(`[render] userId=${userId}: ${skippedAssets.length} Asset(s) übersprungen: ${skippedAssets.slice(0, 12).join(", ")}`);
       }
-      return { png, skippedAssets };
+      const skippedRenderInstances = Array.isArray(state?.skippedRenderInstances) ? state.skippedRenderInstances : [];
+      if (skippedRenderInstances.length) {
+        log(`[render] userId=${userId}: Degraded-Render – ${skippedRenderInstances.length} blockierende Instanz(en) übersprungen: ${skippedRenderInstances.slice(0, 12).join(", ")}`);
+      }
+      return { png, skippedAssets, skippedRenderInstances };
     } finally {
       clearInterval(progressTimer);
     }
@@ -518,8 +559,8 @@ app.get("/render-debug", async (request, response) => {
   busy = true;
   activeJob = `debug:${userId}`;
   try {
-    const { png, skippedAssets } = await renderAvatar(userId, () => {});
-    response.json({ ok: true, userId, bytes: png.length, skippedAssets, build: getBuildInfo() });
+    const { png, skippedAssets, skippedRenderInstances } = await renderAvatar(userId, () => {});
+    response.json({ ok: true, userId, bytes: png.length, skippedAssets, skippedRenderInstances, build: getBuildInfo() });
   } catch (error) {
     response.status(500).json({
       ok: false,
@@ -591,7 +632,7 @@ async function handleRender(interaction) {
     }
     update("Avatar-Daten wurden gefunden. Render wird vorbereitet …", true);
 
-    const { png, skippedAssets } = await renderAvatar(activeJobUser.id, (_phase, message) => update(message));
+    const { png, skippedAssets, skippedRenderInstances } = await renderAvatar(activeJobUser.id, (_phase, message) => update(message));
     clearInterval(heartbeat);
     heartbeat = undefined;
     await editChain;
@@ -615,6 +656,14 @@ async function handleRender(interaction) {
         value: `Roblox liefert diese Assets ohne Authentifizierung nicht mehr (HTTP 401 seit April 2025). ${list}${more}. Mit \`ROBLOX_OPENCLOUD_API_KEY\` werden sie nachgeladen.`,
       });
     }
+    if (skippedRenderInstances?.length) {
+      const list = skippedRenderInstances.slice(0, 6).join(", ");
+      const more = skippedRenderInstances.length > 6 ? ` (+${skippedRenderInstances.length - 6} weitere)` : "";
+      doneEmbed.addFields({
+        name: `⚠️ ${skippedRenderInstances.length} blockierende Instanz(en) übersprungen`,
+        value: `Diese Instanzen ließen sich nicht für das Rendering kompilieren (Render-Descriptor dauerhaft pending/failed) und wurden gezielt entfernt, damit der Rest-Avatar gerendert werden kann: ${list}${more}. Details in den Server-Logs.`,
+      });
+    }
     await interaction.editReply({ embeds: [doneEmbed], files: [attachment] });
   } catch (error) {
     reportError("[render] Render fehlgeschlagen", error);
@@ -636,6 +685,12 @@ async function handleRender(interaction) {
       const consoleProblems = (diagnostics.consoleErrors || []).filter(Boolean).slice(0, 3)
         .map((entry) => String(entry).slice(0, 150));
       if (consoleProblems.length) notes.push(`Console: ${consoleProblems.join(" | ")}`);
+      const prepare = diagnostics.prepare;
+      if (prepare?.stage) {
+        const desc = prepare.descriptors || {};
+        const pending = (prepare.pendingInstances || []).slice(0, 3).join(", ");
+        notes.push(`Vorbereitung: Teilschritt \`${prepare.stage}\`, Descriptors ${desc.compiled ?? "?"}/${desc.total ?? "?"} compiled, ${desc.pending ?? "?"} pending, ${desc.failed ?? "?"} failed${pending ? `, pending: ${pending}` : ""}`);
+      }
       if (notes.length) friendly += `\n\n**Diagnose:**\n${notes.join("\n")}`;
     }
     await editChain;

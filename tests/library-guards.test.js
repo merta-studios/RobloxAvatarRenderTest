@@ -1,6 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { patchAnimatorWrapper, patchHumanoidDescriptionApply, patchOutfitRenderer } from "../src/library-guards.js";
+import {
+  patchAnimatorWrapper,
+  patchHumanoidDescriptionApply,
+  patchOutfitRenderer,
+  patchOutfitRendererRigLoad,
+  patchRenderDescCompile,
+} from "../src/library-guards.js";
 
 /** Dummy-Klasse mit dem gleichen Methoden-Vertrag wie AnimatorWrapper. */
 function makeAnimatorClass() {
@@ -169,4 +175,193 @@ test("Patches ignorieren Klassen ohne passende Methoden", () => {
   assert.deepEqual(patchAnimatorWrapper(class Foo {}), []);
   assert.equal(patchHumanoidDescriptionApply(class Bar {}), false);
   assert.equal(patchOutfitRenderer(class Baz {}), false);
+});
+
+// ---------- Render-Compile-Guard (patchRenderDescCompile) ----------
+
+function makeDescClass(compileImpl) {
+  return class FakeRenderDesc {
+    constructor(renderScene) {
+      this.renderScene = renderScene;
+      this.instance = null;
+    }
+    fromInstance(instance) { this.instance = instance; }
+    async compileResults(...args) { return compileImpl(this, args); }
+  };
+}
+
+function makeFakeEventForGuards() {
+  const event = {
+    fired: [],
+    callbacks: new Set(),
+    Connect(callback) {
+      event.callbacks.add(callback);
+      return { Disconnect: () => event.callbacks.delete(callback) };
+    },
+    Fire(...args) {
+      event.fired.push(args);
+      for (const callback of [...event.callbacks]) callback(...args);
+    },
+  };
+  return event;
+}
+
+test("patchRenderDescCompile: Rejection in compileResults wird zu „failed“ (Response) statt ewig pending", async () => {
+  const addRenderDescCalls = [];
+  const failures = [];
+  const FakeRBXRenderer = {
+    _addRenderDesc: (...args) => { addRenderDescCalls.push(args); },
+  };
+  assert.equal(patchRenderDescCompile(FakeRBXRenderer, {
+    compileDeadlineMs: 500,
+    onFailed: (info) => failures.push(info),
+  }), true);
+
+  const DescClass = makeDescClass(() => { throw new Error("Textur-Decoding fehlgeschlagen"); });
+  const instance = { className: "MeshPart", GetFullName: () => "Rig.Accessory.Handle" };
+  FakeRBXRenderer._addRenderDesc(instance, {}, DescClass, {});
+  assert.equal(addRenderDescCalls.length, 1, "das originale _addRenderDesc läuft weiter");
+
+  const desc = new DescClass({});
+  desc.instance = instance;
+  const result = await desc.compileResults();
+  assert.ok(result instanceof Response, "Fehler müssen als Response ankommen (Bibliothek markiert desc.failed + failedRenderDesc.Fire)");
+  assert.equal(result.status, 502);
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0].reason, "compile-error");
+  assert.equal(failures[0].label, "Rig.Accessory.Handle");
+});
+
+test("patchRenderDescCompile: hängendes compileResults wird per Deadline zu „failed“", async () => {
+  const failures = [];
+  const stoppedLabels = [];
+  const FakeRBXRenderer = { _addRenderDesc: () => {} };
+  patchRenderDescCompile(FakeRBXRenderer, {
+    compileDeadlineMs: 30,
+    onFailed: (info) => failures.push(info),
+    stopLoadingLabel: (label) => stoppedLabels.push(label),
+  });
+  const DescClass = makeDescClass(() => new Promise(() => {})); // hängt für immer
+  const instance = { className: "MeshPart", GetFullName: () => "Rig.Handle" };
+  FakeRBXRenderer._addRenderDesc(instance, {}, DescClass, {});
+
+  const desc = new DescClass({});
+  desc.instance = instance;
+  const startedAt = Date.now();
+  const result = await desc.compileResults();
+  assert.ok(Date.now() - startedAt < 1_000, "Deadline muss schnell feuern");
+  assert.ok(result instanceof Response);
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0].reason, "compile-deadline");
+  assert.deepEqual(stoppedLabels, ["Rig.Handle"], "das hängengebliebene Loading-Label wird abgeräumt");
+});
+
+test("patchRenderDescCompile: erfolgreiche Kompilierung bleibt unverändert, Patch ist idempotent", async () => {
+  const FakeRBXRenderer = { _addRenderDesc: () => {} };
+  assert.equal(patchRenderDescCompile(FakeRBXRenderer, { compileDeadlineMs: 500 }), true);
+  const DescClass = makeDescClass(function fakeCompile() { return [{ name: "three-mesh" }]; });
+  FakeRBXRenderer._addRenderDesc({}, {}, DescClass, {});
+  const wrappedOnce = DescClass.prototype.compileResults;
+  FakeRBXRenderer._addRenderDesc({}, {}, DescClass, {});
+  assert.equal(DescClass.prototype.compileResults, wrappedOnce, "kein doppeltes Wrapping");
+  assert.equal(patchRenderDescCompile(FakeRBXRenderer, { compileDeadlineMs: 500 }), false, "zweiter Patch ist ein No-op");
+
+  const desc = new DescClass({});
+  const result = await desc.compileResults();
+  assert.deepEqual(result, [{ name: "three-mesh" }], "Erfolg wird unverändert durchgereicht");
+});
+
+// ---------- Rig-Lade-Guard (patchOutfitRendererRigLoad) ----------
+
+function makeRigLoadClass() {
+  return class FakeOutfitRenderer {
+    constructor() {
+      this.currentlyChangingRig = false;
+      this.currentRig = undefined;
+      this.currentRigType = "R15";
+      this.doAddInstance = true;
+      this.auth = {};
+      this.renderScene = {};
+      this.onError = makeFakeEventForGuards();
+    }
+  };
+}
+
+function makeRbxLike(rigInstance) {
+  const dataModel = {
+    GetChildren: () => [rigInstance],
+    Destroy: () => {},
+  };
+  return { generateTree: () => dataModel };
+}
+
+test("patchOutfitRendererRigLoad: erfolgreicher Rig-Aufbau bleibt unverändert", async () => {
+  const addInstanceCalls = [];
+  const Class = makeRigLoadClass();
+  const rigInstance = { name: "Rig", setParent: () => {}, Destroy: () => {} };
+  assert.equal(patchOutfitRendererRigLoad(Class, {
+    getRBX: async () => makeRbxLike(rigInstance),
+    addInstance: (...args) => addInstanceCalls.push(args),
+  }), true);
+
+  const renderer = new Class();
+  const result = await renderer._setRigTo("R15");
+  assert.equal(result, rigInstance);
+  assert.equal(renderer.currentRig, rigInstance);
+  assert.equal(renderer.currentlyChangingRig, false);
+  assert.equal(addInstanceCalls.length, 1, "doAddInstance=true → Instanz wird zur Szene hinzugefügt");
+  assert.equal(renderer.onError.fired.length, 0);
+});
+
+test("patchOutfitRendererRigLoad: Throw in generateTree/GetChildren wird zu onError(„rig“) statt Hänger", async () => {
+  const skipped = [];
+  const Class = makeRigLoadClass();
+  patchOutfitRendererRigLoad(Class, {
+    getRBX: async () => ({ generateTree: () => { throw new Error("generateTree: inkonsistenter Baum"); } }),
+    onSkipped: (info) => skipped.push(info),
+  });
+  const renderer = new Class();
+  // Wie in _updateOutfit: Promise.all darf niemals hängen bleiben.
+  const result = await Promise.race([
+    Promise.all([renderer._setRigTo("R15")]),
+    new Promise((resolve) => setTimeout(() => resolve("HANG"), 200)),
+  ]);
+  assert.notEqual(result, "HANG", "ohne den Patch bleibt dieses Promise für immer pending");
+  assert.deepEqual(renderer.onError.fired, [["rig"]], "konkrete Fehlerstufe statt stilles Hängen");
+  assert.equal(renderer.currentlyChangingRig, false);
+  assert.equal(skipped[0].method, "_setRigTo.generateTree");
+});
+
+test("patchOutfitRendererRigLoad: GetRBX-Rejection und undefined-Ergebnis landen beide bei onError(„rig“)", async () => {
+  const Rejected = makeRigLoadClass();
+  patchOutfitRendererRigLoad(Rejected, { getRBX: async () => { throw new Error("RBXM korrupt"); } });
+  const rejectedRenderer = new Rejected();
+  await Promise.all([rejectedRenderer._setRigTo("R15")]);
+  assert.deepEqual(rejectedRenderer.onError.fired, [["rig"]]);
+  assert.equal(rejectedRenderer.currentlyChangingRig, false);
+
+  const Undefined = makeRigLoadClass();
+  patchOutfitRendererRigLoad(Undefined, { getRBX: async () => undefined });
+  const undefinedRenderer = new Undefined();
+  await Promise.all([undefinedRenderer._setRigTo("R6")]);
+  assert.deepEqual(undefinedRenderer.onError.fired, [["rig"]]);
+});
+
+test("patchOutfitRendererRigLoad: bereits laufender Rig-Wechsel löst auf statt zu hängen", async () => {
+  const Class = makeRigLoadClass();
+  patchOutfitRendererRigLoad(Class, { getRBX: async () => undefined });
+  const renderer = new Class();
+  renderer.currentlyChangingRig = true;
+  const result = await Promise.race([
+    renderer._setRigTo("R15"),
+    new Promise((resolve) => setTimeout(() => resolve("HANG"), 100)),
+  ]);
+  assert.notEqual(result, "HANG", "das Original-Promise bleibt hier für immer pending");
+  assert.equal(result, undefined);
+});
+
+test("patchOutfitRendererRigLoad ignoriert unvollständige Optionen/Klassen", () => {
+  assert.equal(patchOutfitRendererRigLoad(null, {}), false);
+  assert.equal(patchOutfitRendererRigLoad(class Foo {}, {}), false);
+  assert.equal(patchOutfitRendererRigLoad(class Bar {}, { getRBX: "keine Funktion" }), false);
 });

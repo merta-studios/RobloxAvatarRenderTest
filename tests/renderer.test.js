@@ -114,15 +114,44 @@ test("Renderer hängt nicht mehr an einzelnen Assets: Guard, Deadline und Skip-R
   assert.match(client, /filter\(\(label\) => !skippedAssetIds\.has/);
 });
 
-test("prepareForThumbnail bekommt eine Stall-erkennende Deadline unter dem 240-s-Watchdog", () => {
+test("Thumbnail-Vorbereitung ist eine begrenzte Zustandsmaschine statt blindem Event-Warten", () => {
   const client = readFileSync(new URL("src/renderer-client.js", root), "utf8");
-  // Die Bibliothek löst prepareForThumbnail evtl. NIE auf (interne .then(resolve)-
-  // Promises). Flache Deadlines würden legitime langsame Renders killen – deshalb
-  // bricht nur echter Stillstand (200 s < Watchdog 240 s) ab.
-  assert.match(client, /withStallDeadline\(outfitRenderer\.prepareForThumbnail\(\)/);
-  assert.match(client, /PREPARE_STALL_LIMIT_MS = 200_000/);
-  assert.match(client, /PREPARE_FLAT_LIMIT_MS = 400_000/);
-  assert.match(client, /getProgressSignature: \(\) =>/);
+  // Der Produktions-Stall: `onRenderSuccess` feuert nie, wenn ein Render-
+  // Descriptor dauerhaft pending bleibt (`_addRenderDesc` ohne catch). Der alte
+  // Event-Replay-Patch konnte das nicht reparieren – deshalb wird
+  // prepareForThumbnail() NICHT mehr abgewartet.
+  assert.doesNotMatch(client, /withStallDeadline\(outfitRenderer\.prepareForThumbnail\(\)/);
+  assert.doesNotMatch(client, /await[^;]*prepareForThumbnail\(\)/);
+  assert.match(client, /createThumbnailPipeline\(\{/);
+  // Jede Stufe hat eine eigene Deadline; Summe bleibt unter dem Render-Timeout.
+  assert.match(client, /OUTFIT_STAGE_LIMIT_MS = 210_000/);
+  assert.match(client, /POSE_STAGE_LIMIT_MS = 30_000/);
+  assert.match(client, /COMPILE_STAGE_LIMIT_MS = 120_000/);
+  assert.match(client, /DESC_STALL_LIMIT_MS = 30_000/);
+  assert.match(client, /PREPARE_TOTAL_LIMIT_MS = 395_000/);
+  // Render-Compile-Pfad: Fehler/Deadline in compileResults werden zu „failed“
+  // (failedRenderDesc feuert) statt ewig pending ohne jedes Event.
+  assert.match(client, /patchRenderDescCompile\(RBXRenderer/);
+  assert.match(client, /COMPILE_STEP_DEADLINE_MS = 150_000/);
+  // _setRigTo: Throws in generateTree/GetChildren werden zu onError("rig").
+  assert.match(client, /patchOutfitRendererRigLoad\(OutfitRenderer/);
+  // Diagnose: konkreter interner Teilschritt + pending Descriptors in
+  // window.__renderState statt nur `assets|`.
+  assert.match(client, /prepareStage/);
+  assert.match(client, /mergePrepareDiagnostics/);
+  assert.match(client, /skippedRenderInstances/);
+});
+
+test("Server protokolliert die internen Vorbereitungs-Teilschritte und meldet sie an Discord", () => {
+  const server = readFileSync(new URL("src/server.js", root), "utf8");
+  // Bei einem Fehler müssen Teilschritt, Descriptor-Zähler und pending
+  // Instanzen in Logs UND Discord-Diagnose auftauchen.
+  assert.match(server, /describePrepareDiagnostics/);
+  assert.match(server, /prepareStage=/);
+  assert.match(server, /pendingInstances=/);
+  assert.match(server, /prepare: describePrepareDiagnostics\(state\)/);
+  assert.match(server, /diagnostics\.prepare/);
+  assert.match(server, /skippedRenderInstances/);
 });
 
 test("fetchWithTimeout bricht nur die Header-Phase ab, nicht den Body-Stream", () => {
