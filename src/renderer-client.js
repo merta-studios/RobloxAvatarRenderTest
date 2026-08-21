@@ -15,6 +15,7 @@ import { createAssetVersionMap, recordAssetVersions, rewriteAssetDeliveryUrl } f
 import { extractAssetIdFromUrl, guardGetAssetBuffer, guardGetMesh, guardGetRBX } from "./asset-loader-guard.js";
 import {
   patchAnimatorWrapper,
+  patchGetCDNURLFromAssetDelivery,
   patchHumanoidDescriptionApply,
   patchOutfitRendererRigLoad,
   patchRenderDescCompile,
@@ -228,6 +229,21 @@ FLAGS.ENABLE_API_RBX_CACHE = false;
 FLAGS.AUDIO_ENABLED = false;
 FLAGS.GEAR_ENABLED = false;
 FLAGS.API_REQUEST_RETRY = true;
+
+/**
+ * Sicherheitsnetz für den Asset-Delivery-Pfad der Bibliothek:
+ * `API.Misc.getCDNURLFromAssetDelivery` liest im Original bei HTTP 200 blind
+ * `data.locations[0].location` und wirft bei einer Antwort ohne `locations`
+ * „Cannot read properties of undefined (reading '0')“ – in eine Promise-Kette
+ * OHNE catch (beobachtet 4–6× pro Produktions-Render). Das Asset löst dann NIE
+ * auf und wird erst nach 150 s von der Guard-Deadline übersprungen.
+ *
+ * Die Funktion wird deshalb KOMPLETT ERSETZT (Wrappen hilft nicht, der Crash
+ * passiert im Original): fehlende Location ⇒ Response 502 ⇒ sofortiger Skip
+ * mit echtem Grund. LoadImage-Override und GetRBX laufen über
+ * assetURLToCDNURL und sind damit automatisch mit abgesichert.
+ */
+patchGetCDNURLFromAssetDelivery(API, FLAGS);
 
 /**
  * Härtet die Asset-Loader der Bibliothek ab: Ein einzelnes nicht ladbares Asset

@@ -364,3 +364,69 @@ export function patchRenderDescCompile(RBXRendererClass, options = {}) {
   Object.defineProperty(RBXRendererClass, flag, { value: true, enumerable: false, configurable: true });
   return true;
 }
+
+/**
+ * ERSETZT `API.Misc.getCDNURLFromAssetDelivery` vollständig (kein Wrapper –
+ * der Crash passiert IM Original).
+ *
+ * Original (dist/index.js 1.6.2, ~Z. 39001):
+ *
+ *   const response = await RBLXGet(url, headers);
+ *   if (response.status !== 200) return response;
+ *   const data = await response.json();
+ *   return data.locations[0].location;   // ← TypeError, wenn `locations` fehlt
+ *
+ * Produktions-Beleg (Browser-pageerror, 4–6× pro Render):
+ *   Cannot read properties of undefined (reading '0')
+ *     at Object.getCDNURLFromAssetDelivery (…/assets/index-….js)
+ *     at async Object.assetURLToCDNURL (…)
+ *
+ * Der TypeError fliegt in eine Promise-Kette OHNE catch: `GetAssetBuffer` löst
+ * NIE auf, das Asset wird erst durch die Guard-Deadline nach 150 s
+ * übersprungen (~194 s Renderzeit, Discord-Skip-Grund „Zeitlimit 150 s“).
+ *
+ * Der Ersatz verhält sich für den Erfolgsfall identisch, bedient zusätzlich das
+ * Singular-Schema (`{location: …}`) und liefert bei fehlender Location eine
+ * nicht-ok `Response` (502) zurück – genau die Semantik, die
+ * `getAssetBufferInternal`/`GetRBX` und unsere Guards als „übersprungen (HTTP
+ * 502)“ auswerten. Damit ist dieses Muster nie wieder ein Endlos-Hänger.
+ *
+ * Detail: Das Original ruft intern `RBLXGet` (nicht exportiert) auf. Der Ersatz
+ * ruft `FLAGS.FETCH_FUNC` direkt – der Bot leitet damit ohnehin jede
+ * https-Anfrage über den eigenen Proxy; `credentials` sind für same-Origin-
+ * Requests an `/roblox-proxy` bedeutungslos. Auf den RBLXGet-Retry (1 Versuch
+ * bei Status ≠ 200) wird bewusst verzichtet: Der Proxy selbst wiederholt
+ * bereits, und ein 401/502 soll SOFORT zum Skip mit echtem Grund führen.
+ *
+ * @param {{ Misc: { getCDNURLFromAssetDelivery: Function } }} API das exportierte API-Objekt
+ * @param {{ ASSETDELIVERY_V2?: boolean, FETCH_FUNC?: Function, API_REQUEST_PREFIX?: string }} FLAGS die exportierten FLAGS
+ * @returns {boolean} true, wenn ersetzt wurde
+ */
+export function patchGetCDNURLFromAssetDelivery(API, FLAGS) {
+  if (!API?.Misc || typeof API.Misc.getCDNURLFromAssetDelivery !== "function") return false;
+
+  API.Misc.getCDNURLFromAssetDelivery = async function getCDNURLFromAssetDelivery(url, headers) {
+    if (!FLAGS.ASSETDELIVERY_V2 || !String(url).includes("assetdelivery.roblox.com/v2/")) return url;
+
+    const doFetch = FLAGS.FETCH_FUNC || fetch;
+    const response = await doFetch((FLAGS.API_REQUEST_PREFIX || "") + url, {
+      headers: new Headers({ "Content-Type": "application/json", ...(headers || {}) }),
+    });
+    if (response.status !== 200) return response;
+
+    const data = await response.json().catch(() => null);
+    const location = Array.isArray(data?.locations) && data.locations[0]?.location
+      ? data.locations[0].location
+      : (typeof data?.location === "string" && data.location ? data.location : null);
+    if (location) return location;
+
+    // Kein Throw: Eine nicht-ok Response ist der Rückgabewert, den die
+    // Bibliothek an dieser Stelle ohnehin kennt (Status ≠ 200 oben).
+    return new Response(JSON.stringify(data ?? { error: "Asset-Delivery ohne Location" }), {
+      status: 502,
+      statusText: "Asset-Delivery ohne Location",
+      headers: { "content-type": "application/json" },
+    });
+  };
+  return true;
+}
