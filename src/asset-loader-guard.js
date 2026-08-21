@@ -38,10 +38,15 @@ export function extractAssetIdFromUrl(url) {
  *  - nicht-erfolgreiche Response (z. B. HTTP 401) -> `undefined` (überspringen),
  *  - kein Ergebnis innerhalb von `deadlineMs` -> `undefined` (überspringen).
  *
+ * `onSkipped` erhält als zweiten Parameter eine kurze GRUND-Beschreibung
+ * („HTTP 401“, „Zeitlimit 150 s“, …), die der Server in die Discord-Antwort
+ * übernimmt – so ist sofort unterscheidbar, ob ein Asset wegen fehlender
+ * Authentifizierung, eines Zeitlimits oder eines Netzwerkfehlers fehlt.
+ *
  * Erfolgreiche ArrayBuffer-Ergebnisse passieren unverändert.
  *
  * @param {(url: string, headers?: object, extraStr?: string) => Promise<unknown>} originalGetAssetBuffer
- * @param {{ deadlineMs?: number, onSkipped?: (url: string) => void }} [options]
+ * @param {{ deadlineMs?: number, onSkipped?: (url: string, reason?: string) => void }} [options]
  * @returns {(url: string, headers?: object, extraStr?: string) => Promise<unknown>}
  */
 export function guardGetAssetBuffer(originalGetAssetBuffer, options = {}) {
@@ -51,20 +56,20 @@ export function guardGetAssetBuffer(originalGetAssetBuffer, options = {}) {
     const outcome = Promise.resolve(originalGetAssetBuffer(url, headers, extraStr))
       .then((result) => {
         if (result instanceof Response && !result.ok) {
-          onSkipped(url);
+          onSkipped(url, `HTTP ${result.status}`);
           return undefined;
         }
         return result;
       })
-      .catch(() => {
+      .catch((error) => {
         // Die Bibliothek vergisst hier ihr Loading-Label; wir überspringen das
         // Asset und lassen den Render weiterlaufen, statt ewig zu warten.
-        onSkipped(url);
+        onSkipped(url, error?.message ? String(error.message).slice(0, 80) : "Netzwerkfehler");
         return undefined;
       });
     const deadline = new Promise((resolve) => {
       deadlineTimer = setTimeout(() => {
-        onSkipped(url);
+        onSkipped(url, `Zeitlimit ${Math.max(1, Math.round(deadlineMs / 1000))} s`);
         resolve(undefined);
       }, deadlineMs);
     });
@@ -87,7 +92,7 @@ export function guardGetAssetBuffer(originalGetAssetBuffer, options = {}) {
  *  - kein Ergebnis innerhalb von `deadlineMs` -> `undefined` (überspringen).
  *
  * @param {(url: string, headers?: object, extraStr?: string) => Promise<unknown>} originalGetRBX
- * @param {{ deadlineMs?: number, onSkipped?: (url: string) => void }} [options]
+ * @param {{ deadlineMs?: number, onSkipped?: (url: string, reason?: string) => void }} [options]
  * @returns {(url: string, headers?: object, extraStr?: string) => Promise<unknown>}
  */
 export function guardGetRBX(originalGetRBX, options = {}) {
@@ -95,13 +100,13 @@ export function guardGetRBX(originalGetRBX, options = {}) {
   return function guardedGetRBX(url, headers, contentRepresentationPriorityList) {
     let deadlineTimer;
     const outcome = Promise.resolve(originalGetRBX(url, headers, contentRepresentationPriorityList))
-      .catch(() => {
-        onSkipped(url);
+      .catch((error) => {
+        onSkipped(url, error?.message ? String(error.message).slice(0, 80) : "RBXM-Fehler");
         return undefined;
       });
     const deadline = new Promise((resolve) => {
       deadlineTimer = setTimeout(() => {
-        onSkipped(url);
+        onSkipped(url, `Zeitlimit ${Math.max(1, Math.round(deadlineMs / 1000))} s`);
         resolve(undefined);
       }, deadlineMs);
     });
@@ -116,7 +121,7 @@ export function guardGetRBX(originalGetRBX, options = {}) {
  * `instanceof Response` und läuft sonst in einen TypeError auf `undefined`.
  *
  * @param {(url: string, headers?: object, readOnly?: boolean) => Promise<unknown>} originalGetMesh
- * @param {{ onSkipped?: (url: string) => void }} [options]
+ * @param {{ onSkipped?: (url: string, reason?: string) => void }} [options]
  * @returns {(url: string, headers?: object, readOnly?: boolean) => Promise<unknown>}
  */
 export function guardGetMesh(originalGetMesh, options = {}) {
@@ -124,7 +129,7 @@ export function guardGetMesh(originalGetMesh, options = {}) {
   return async function guardedGetMesh(url, headers, readOnly) {
     const result = await originalGetMesh(url, headers, readOnly);
     if (result === undefined) {
-      onSkipped(url);
+      onSkipped(url, "Basis-Download fehlgeschlagen");
       return new Response("Mesh konnte nicht geladen werden", {
         status: 502,
         statusText: "Mesh nicht ladbar",

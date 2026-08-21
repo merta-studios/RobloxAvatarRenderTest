@@ -123,3 +123,50 @@ test("openCloudAssetDeliveryUrl leitet assetdelivery-URLs auf die OpenCloud-API 
   assert.equal(openCloudAssetDeliveryUrl("https://example.com/foo"), null);
   assert.equal(openCloudAssetDeliveryUrl("not a url"), null);
 });
+
+test("openCloudAssetDeliveryUrlCandidates liefert versioniert zuerst, dann unversioniert", async () => {
+  const { openCloudAssetDeliveryUrlCandidates } = await import("../src/roblox.js");
+  // Versionierte URL → beide Kandidaten (versioniert exakt, unversioniert als
+  // Rückfallebene, falls OpenCloud die Versionsnummer nicht akzeptiert).
+  assert.deepEqual(
+    openCloudAssetDeliveryUrlCandidates("https://assetdelivery.roblox.com/v2/assetId/13576957688/version/17576717563"),
+    [
+      "https://apis.roblox.com/asset-delivery-api/v1/assetId/13576957688/version/17576717563",
+      "https://apis.roblox.com/asset-delivery-api/v1/assetId/13576957688",
+    ],
+  );
+  // Unversionierte URL → nur der unversionierte Kandidat.
+  assert.deepEqual(
+    openCloudAssetDeliveryUrlCandidates("https://assetdelivery.roblox.com/v2/asset?id=13576957688"),
+    ["https://apis.roblox.com/asset-delivery-api/v1/assetId/13576957688"],
+  );
+  assert.deepEqual(openCloudAssetDeliveryUrlCandidates("https://example.com/foo"), []);
+});
+
+test("pickEnvelopeLocation bevorzugt den zum Roblox-AssetFormat passenden Eintrag", async () => {
+  const { pickEnvelopeLocation } = await import("../src/roblox.js");
+  const envelope = {
+    locations: [
+      { assetFormat: "source", location: "https://t0.rbxcdn.com/source" },
+      { assetFormat: "avatar_meshpart_head", location: "https://t0.rbxcdn.com/head" },
+    ],
+  };
+  assert.equal(pickEnvelopeLocation(envelope, "avatar_meshpart_head"), "https://t0.rbxcdn.com/head");
+  assert.equal(pickEnvelopeLocation(envelope), "https://t0.rbxcdn.com/source");
+  assert.equal(pickEnvelopeLocation(envelope, "unbekannt"), "https://t0.rbxcdn.com/source");
+  // Direkte Location (Antwortform der OpenCloud-API ohne locations-Array).
+  assert.equal(pickEnvelopeLocation({ location: "https://t1.rbxcdn.com/direct" }), "https://t1.rbxcdn.com/direct");
+  // Fehler-Antworten bleiben ausgeschlossen.
+  assert.equal(pickEnvelopeLocation({ errors: [{ code: 401 }] }), null);
+  assert.equal(pickEnvelopeLocation(null), null);
+});
+
+test("buildLocationsEnvelope erzeugt genau das Format, das getCDNURLFromAssetDelivery parst", async () => {
+  const { buildLocationsEnvelope } = await import("../src/roblox.js");
+  const envelope = buildLocationsEnvelope("https://fts.rbxcdn.com/sc2/abc?__token__=x", "avatar_meshpart_head");
+  // Die Bibliothek liest data.locations[0].location – das muss immer gesetzt sein.
+  assert.equal(envelope.locations[0].location, "https://fts.rbxcdn.com/sc2/abc?__token__=x");
+  assert.equal(envelope.locations[0].assetFormat, "avatar_meshpart_head");
+  const fallback = buildLocationsEnvelope("https://t2.rbxcdn.com/y");
+  assert.equal(fallback.locations[0].assetFormat, "source");
+});

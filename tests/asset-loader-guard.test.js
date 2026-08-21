@@ -116,3 +116,39 @@ test("GetRBX-Guard lässt RBX-Instanzen und Response-Fehler unverändert durch",
   const guardedResponse = guardGetRBX(async () => failed);
   assert.equal(await guardedResponse("rbxassetid://13576957688"), failed);
 });
+
+test("Guards melden den GRUND des Überspringens (HTTP-Status, Zeitlimit, Fehler)", async () => {
+  const events = [];
+  const buffered = guardGetAssetBuffer(
+    async (url) => (url === "rbxassetid://1" ? new Response("{}", { status: 401 }) : undefined),
+    { deadlineMs: 25, onSkipped: (url, reason) => events.push([url, reason]) },
+  );
+  assert.equal(await buffered("rbxassetid://1"), undefined);
+  assert.deepEqual(events[0], ["rbxassetid://1", "HTTP 401"]);
+
+  // Rejection → gekürzter Fehlercode als Grund.
+  const rejected = guardGetAssetBuffer(
+    async () => { throw new TypeError("Failed to fetch: net::ERR"); },
+    { onSkipped: (url, reason) => events.push([url, reason]) },
+  );
+  assert.equal(await rejected("rbxassetid://2"), undefined);
+  assert.deepEqual(events[1], ["rbxassetid://2", "Failed to fetch: net::ERR"]);
+
+  // Deadline → Zeitlimit als Grund (der Fall, der vorher wie ein 401 aussah).
+  const timed = guardGetRBX(
+    () => new Promise(() => {}),
+    { deadlineMs: 20, onSkipped: (url, reason) => events.push([url, reason]) },
+  );
+  assert.equal(await timed("rbxassetid://3"), undefined);
+  assert.deepEqual(events[2], ["rbxassetid://3", "Zeitlimit 1 s"]);
+
+  // Mesh ohne Basis-Buffer → Grund statt nackter ID.
+  const meshEvents = [];
+  const mesh = guardGetMesh(async () => undefined, {
+    onSkipped: (url, reason) => meshEvents.push([url, reason]),
+  });
+  const meshResult = await mesh("rbxassetid://4");
+  assert.ok(meshResult instanceof Response);
+  assert.equal(meshResult.status, 502);
+  assert.deepEqual(meshEvents, [["rbxassetid://4", "Basis-Download fehlgeschlagen"]]);
+});
