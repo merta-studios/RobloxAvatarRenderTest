@@ -48,6 +48,12 @@ console.log(JSON.stringify({
   message: state.message,
   error: state.error,
   assetLabels: (state.assetLabels || []).slice(-10),
+  // Interne Diagnose der Thumbnail-Zustandsmaschine: konkreter Teilschritt,
+  // Render-Descriptor-Zähler und die zuletzt pending Instanzen.
+  prepareStage: state.prepareStage,
+  prepare: state.prepare || null,
+  skippedAssets: (state.skippedAssets || []).slice(-10),
+  skippedRenderInstances: (state.skippedRenderInstances || []).slice(-10),
 }, null, 2));
 if (state.error) {
   console.error("--- Browser-Probleme ---");
