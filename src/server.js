@@ -363,6 +363,30 @@ function locationsEnvelopeResponse(location, assetFormat = null) {
   });
 }
 
+/**
+ * Baut aus einer Upstream-Antwort, die der Browser NICHT als Erfolg sehen darf,
+ * eine Fehlerantwort mit dem ORIGINAL-Body. Nötig für Asset-Delivery-Antworten
+ * mit HTTP 200 ohne Location (z. B. `{"errors":[…]}` mit Status 200): Die
+ * Bibliothek liest bei Status 200 blind `data.locations[0].location` und wirft
+ * „Cannot read properties of undefined (reading '0')“ in eine Promise-Kette
+ * OHNE catch – das Asset löst dann NIE auf und wird erst durch die
+ * Guard-Deadline nach 150 s übersprungen. Mit einem echten Fehlerstatus kehrt
+ * `getCDNURLFromAssetDelivery` früh zurück, der Guard überspringt sofort und
+ * der Grund („HTTP 502“) steht in der Discord-Antwort statt „Zeitlimit 150 s“.
+ *
+ * @param {string} bodyText Original-Body (bereits gelesener Klon)
+ * @param {string|null} contentType Original-Content-Type
+ * @param {number} [status] Fehlerstatus für den Browser
+ * @returns {Response}
+ */
+function errorPassthroughResponse(bodyText, contentType, status = 502) {
+  return new Response(bodyText ?? "", {
+    status,
+    statusText: "Asset-Delivery ohne Location",
+    headers: { "content-type": contentType || "application/json" },
+  });
+}
+
 function isRetryableHttpStatus(status) {
   return [429, 500, 502, 503, 504].includes(status);
 }
@@ -436,8 +460,15 @@ function urlHost(rawUrl) {
  * selbst über die CDN-Location. Vorher streamte der Proxy bei erfolgreicher
  * OpenCloud-Nachladung die Binärdaten direkt – `response.json()` der Bibliothek
  * scheiterte dann in einer Promise-Kette ohne catch, das Asset löste nie auf
- * und wurde erst nach der 150-s-Guard-Deadline übersprungen. Genau das war die
- * Ursache für „Shirt/Hose/Accessoire fehlen trotz API-Key“.
+ * und wurde erst nach der 150-s-Guard-Deadline übersprungen (PR #15).
+ *
+ * WICHTIG 2 – jede 200-Antwort MUSS eine Location enthalten: Die Bibliothek
+ * liest bei Status 200 blind `data.locations[0].location`. Ein 200 ohne
+ * `locations` (Roblox liefert für UGC am öffentlichen Endpunkt teils einen
+ * Errors-Body mit Status 200) erzeugte im Browser
+ * „Cannot read properties of undefined (reading '0')“ – wieder ohne catch,
+ * wieder Endlos-Hänger bis zur Guard-Deadline. Deshalb wird ein 200 ohne
+ * Location hier zu HTTP 502 mit Original-Body (errorPassthroughResponse).
  *
  * @returns {Promise<{upstream: Response|null, via: string, openCloudStatus: number|null}>}
  */
@@ -495,15 +526,47 @@ async function fetchUpstreamWithFallbacks(url, extraHeaders, controller) {
   for (let attempt = 0; attempt <= 2; attempt += 1) {
     const { response: upstream, finalUrl } = await fetchAllowedRobloxUrl(url, controller.signal, extraHeaders);
     if (upstream.ok && isAssetDelivery) {
+      const preferredFormat = extraHeaders["roblox-assetformat"] || null;
       const inspected = await inspectOpenCloudAssetResponse(upstream);
       if (inspected.kind === "raw") {
-        // Öffentlicher Endpunkt hat zur Binärdatei weitergeleitet (alte
-        // /v1/asset/?id=-Form): ebenfalls Envelope statt Binary.
+        if (finalUrl !== url) {
+          // Öffentlicher Endpunkt hat zur Binärdatei weitergeleitet (alte
+          // /v1/asset/?id=-Form): ebenfalls Envelope statt Binary.
+          discardBody(upstream);
+          log(`[proxy] assetdelivery-Binärweiterleitung → Envelope: HTTP ${upstream.status}, content-type=${inspected.contentType || "?"} (${inspected.reason}), ${finalUrl.slice(0, 120)}`);
+          return { upstream: locationsEnvelopeResponse(finalUrl), via: "assetdelivery-envelope", openCloudStatus: null };
+        }
+        // Kein Redirect UND kein JSON: Ohne Weiterleitungsziel gibt es keine
+        // Location, die in eine Envelope gehört (eine Envelope auf die
+        // assetdelivery-URL selbst würde der Bibliothek nur JSON-Bytes als
+        // „Asset“ unterschieben). Ehrlicher Fehler statt stiller Datenmüll.
+        const rawSnippet = inspected.bodyText
+          ? compactBodySnippet(inspected.bodyText)
+          : await readResponseBodySnippet(upstream);
         discardBody(upstream);
-        log(`[proxy] assetdelivery-Binärweiterleitung → Envelope: ${finalUrl.slice(0, 100)}`);
-        return { upstream: locationsEnvelopeResponse(finalUrl), via: "assetdelivery-envelope", openCloudStatus: null };
+        log(`[proxy] assetdelivery HTTP ${upstream.status} mit unerwartetem Content-Type ${inspected.contentType || "?"} (${inspected.reason}) ohne Weiterleitung: ${url.slice(0, 160)} body="${rawSnippet}"`);
+        return { upstream: errorPassthroughResponse(rawSnippet, inspected.contentType), via: "assetdelivery-no-location", openCloudStatus: null };
       }
-      return { upstream, via: "assetdelivery", openCloudStatus: null };
+      const location = pickEnvelopeLocation(inspected.json, preferredFormat);
+      if (location) {
+        if (!isAllowedRobloxAssetUrl(location)) {
+          // Tripwire für weitere CDN-Hosts: Der Browser würde die Location
+          // gleich über den Proxy anfordern und dort HTTP 400 bekommen.
+          log(`[proxy] assetdelivery-Location mit unerlaubtem Host ${urlHost(location)}: ${location.slice(0, 160)} – Asset wird scheitern, Host ggf. in allowedHosts aufnehmen`);
+        }
+        return { upstream, via: "assetdelivery", openCloudStatus: null };
+      }
+      // HTTP 200 OHNE Location (z. B. Errors-Body mit Status 200): der einzige
+      // 200-Pfad, der bisher ungeloggt durchgereicht wurde – und exakt der
+      // Auslöser des Browser-TypeErrors „reading '0'“ inkl. Endlos-Hänger.
+      const bodySnippet = compactBodySnippet(inspected.bodyText);
+      discardBody(upstream);
+      log(`[proxy] assetdelivery HTTP 200 ohne Location: ${url.slice(0, 160)} body="${bodySnippet}"`);
+      return {
+        upstream: errorPassthroughResponse(inspected.bodyText, inspected.contentType),
+        via: "assetdelivery-no-location",
+        openCloudStatus: null,
+      };
     }
     const retryable = isRetryableHttpStatus(upstream.status);
     if (!retryable || attempt === 2) return { upstream, via: "assetdelivery", openCloudStatus: null };
@@ -900,15 +963,21 @@ async function handleRender(interaction) {
       // Unterscheidet „Key fehlt“ von „Key gesetzt, aber von Roblox abgelehnt“
       // von „Key aktiv, Assets trotzdem fehlgeschlagen“ – vorher stand hier immer
       // derselbe statische Hinweis, selbst wenn der Key längst konfiguriert war.
+      // Skip-Gründe wie „HTTP 401“/„HTTP 502“ entstehen im Proxy – dort steht
+      // pro Asset die konkrete Ursache (Host, Status, Body-Ausschnitt).
+      const hasHttpReason = (skippedAssetDetails || []).some((entry) => /HTTP (401|403|404|502)/.test(String(entry?.reason || "")));
+      const logHint = " Die Server-Logs nennen pro Asset den konkreten Grund – Zeilen `[proxy] OpenCloud-Location mit unerlaubtem Host …` (CDN-Host nicht in der Allowlist), `[proxy] assetdelivery HTTP 200 ohne Location: …` und `[proxy] OpenCloud ohne Location: …`.";
       let hint;
       if (!config.openCloudApiKey) {
         hint = "Roblox liefert diese Assets ohne Authentifizierung nicht mehr (HTTP 401 seit April 2025). Setze `ROBLOX_OPENCLOUD_API_KEY` (User-Key mit Scope `legacy-asset:manage`), dann werden sie über die OpenCloud Asset-Delivery-API nachgeladen.";
       } else if (openCloudState.probeStatus === "rejected") {
         hint = `Der OpenCloud-API-Key ist zwar gesetzt, wird von Roblox aber ABGELEHNT (HTTP ${openCloudState.probeHttp ?? "?"}${openCloudState.probeMessage ? `: ${openCloudState.probeMessage.slice(0, 90)}` : ""}). Der Key muss als User-Key mit Scope \`legacy-asset:manage\` angelegt sein (https://create.roblox.com/dashboard/credentials) – danach neu deployen. Details: /health unter openCloud.probe.`;
       } else if (openCloudState.probeStatus === "ok") {
-        hint = "OpenCloud-Key ist aktiv und wurde von Roblox akzeptiert – diese Assets sind trotzdem fehlgeschlagen (Grund in Klammern, Details in den Server-Logs).";
+        hint = "OpenCloud-Key ist aktiv und wurde von Roblox akzeptiert – diese Assets sind trotzdem fehlgeschlagen (Grund in Klammern)."
+          + (hasHttpReason ? logHint : " Details in den Server-Logs.");
       } else {
-        hint = "OpenCloud-Key ist gesetzt. Prüfe /health (openCloud.probe) und die Server-Logs, warum die Nachladung dieser Assets fehlschlug.";
+        hint = "OpenCloud-Key ist gesetzt. Prüfe /health (openCloud.probe) und die Server-Logs, warum die Nachladung dieser Assets fehlschlug."
+          + (hasHttpReason ? logHint : "");
       }
       doneEmbed.addFields({
         name: `⚠️ ${skippedAssets.length} Asset(s) übersprungen`,
