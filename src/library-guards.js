@@ -96,11 +96,51 @@ export function patchAnimatorWrapper(AnimatorWrapperClass, options = {}) {
  * @returns {boolean} true, wenn ein Patch durchgeführt wurde
  */
 export function patchHumanoidDescriptionApply(HumanoidDescriptionWrapperClass, options = {}) {
-  const { onSkipped = () => {} } = options;
+  const { onSkipped = () => {}, stepDeadlineMs = 165_000 } = options;
   const proto = HumanoidDescriptionWrapperClass?.prototype;
   if (!proto || proto[PATCHED_FLAG]) return false;
   const original = proto.applyDescription;
   if (typeof original !== "function") return false;
+
+  // applyDescription startet diese Methoden parallel. Mehrere davon bauen um
+  // GetRBX().then(...) eigene Promises, deren Executor bei einem Throw (etwa
+  // generateTree()/GetChildren() auf einem ungewöhnlichen UGC-Asset) niemals
+  // resolve aufruft. Ein Catch um applyDescription hilft dann nicht: Das innere
+  // Promise ist pending, nicht rejected. Deshalb bekommt jeder einzelne
+  // Arbeitsschritt eine Deadline und Skip-Semantik. Der Rest des Avatars kann
+  // anschließend fertig gebaut werden.
+  const stepNames = [
+    "_applyAccessories",
+    "_applyClothing",
+    "_applyBodyParts",
+    "_applyFace",
+    "_applyAnimations",
+    "_applyMakeup",
+    "_applyGear",
+  ];
+  for (const name of stepNames) {
+    const originalStep = proto[name];
+    if (typeof originalStep !== "function") continue;
+    proto[name] = function guardedDescriptionStep(...args) {
+      let timer;
+      const outcome = Promise.resolve().then(() => originalStep.apply(this, args));
+      // Die eventuell später eintreffende Rejection des Originals stets
+      // beobachten, auch wenn die Deadline das Rennen bereits gewonnen hat.
+      outcome.catch(() => {});
+      const deadline = new Promise((resolve) => {
+        timer = setTimeout(() => {
+          onSkipped({ method: name, error: new Error(`${name} hat nach ${Math.round(stepDeadlineMs / 1000)} s das Zeitlimit erreicht`) });
+          resolve(undefined);
+        }, stepDeadlineMs);
+      });
+      return Promise.race([outcome, deadline])
+        .catch((error) => {
+          onSkipped({ method: name, error });
+          return undefined;
+        })
+        .finally(() => clearTimeout(timer));
+    };
+  }
 
   proto.applyDescription = async function guardedApplyDescription(...args) {
     try {
@@ -111,5 +151,58 @@ export function patchHumanoidDescriptionApply(HumanoidDescriptionWrapperClass, o
     }
   };
   Object.defineProperty(proto, PATCHED_FLAG, { value: true, enumerable: false, configurable: true });
+  return true;
+}
+
+/**
+ * Schließt zwei Event-Races in OutfitRenderer 1.6.2:
+ *  - Der Konstruktor startet _updateOutfit sofort; onSuccess kann bereits vor
+ *    dem Listener in _prepareForThumbnail gefeuert worden sein.
+ *  - addInstance kann synchron fertig kompilieren und onRenderSuccess feuern,
+ *    BEVOR _prepareForThumbnail unmittelbar danach seinen Listener verbindet.
+ *
+ * Nach dem Verbinden wird der aktuelle Zustand deshalb einmal nachgespielt.
+ * Das ändert den normalen Pfad nicht, löst aber ein bereits verpasstes Signal
+ * auf, statt 200 Sekunden bei der leeren Signatur `assets|` zu hängen.
+ */
+export function patchOutfitRenderer(OutfitRendererClass) {
+  const proto = OutfitRendererClass?.prototype;
+  const flag = "__avatarRenderEventRaceGuarded";
+  if (!proto || proto[flag] || typeof proto.prepareForThumbnail !== "function") return false;
+  const original = proto.prepareForThumbnail;
+
+  proto.prepareForThumbnail = async function guardedPrepareForThumbnail(...args) {
+    const successEvent = this.onSuccess;
+    const renderEvent = this.onRenderSuccess;
+    const successConnect = successEvent?.Connect;
+    const renderConnect = renderEvent?.Connect;
+
+    if (typeof successConnect === "function") {
+      successEvent.Connect = (callback) => {
+        const connection = successConnect.call(successEvent, callback);
+        queueMicrotask(() => {
+          if (this.currentRig && !this.currentlyUpdating && !this.currentlyChangingRig) callback();
+        });
+        return connection;
+      };
+    }
+    if (typeof renderConnect === "function") {
+      renderEvent.Connect = (callback) => {
+        const connection = renderConnect.call(renderEvent, callback);
+        // fireFullyRenderedIfNeeded prüft selbst alle Voraussetzungen. Wichtig:
+        // erst nach Connect aufrufen, damit ein synchrones Event nicht verloren geht.
+        queueMicrotask(() => this.fireFullyRenderedIfNeeded?.());
+        return connection;
+      };
+    }
+
+    try {
+      return await original.apply(this, args);
+    } finally {
+      if (successEvent && successConnect) successEvent.Connect = successConnect;
+      if (renderEvent && renderConnect) renderEvent.Connect = renderConnect;
+    }
+  };
+  Object.defineProperty(proto, flag, { value: true, enumerable: false, configurable: true });
   return true;
 }
