@@ -2,6 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   patchAnimatorWrapper,
+  patchGetCDNURLFromAssetDelivery,
   patchHumanoidDescriptionApply,
   patchOutfitRenderer,
   patchOutfitRendererRigLoad,
@@ -364,4 +365,92 @@ test("patchOutfitRendererRigLoad ignoriert unvollständige Optionen/Klassen", ()
   assert.equal(patchOutfitRendererRigLoad(null, {}), false);
   assert.equal(patchOutfitRendererRigLoad(class Foo {}, {}), false);
   assert.equal(patchOutfitRendererRigLoad(class Bar {}, { getRBX: "keine Funktion" }), false);
+});
+
+// --- getCDNURLFromAssetDelivery: Ersatz statt Wrapper ----------------------
+
+/**
+ * Nachbau des Originals aus roavatar-renderer 1.6.2 (dist/index.js ~Z. 39001) –
+ * inklusive des ungeschützten `data.locations[0].location`. Damit ist im Test
+ * nachvollziehbar, WARUM ein Wrapper nicht reicht: Der TypeError entsteht im
+ * Original, nicht im Aufrufer.
+ */
+function makeOriginalApi(fetchImpl) {
+  const FLAGS = { ASSETDELIVERY_V2: true, API_REQUEST_PREFIX: "", FETCH_FUNC: fetchImpl };
+  const API = {
+    Misc: {
+      async getCDNURLFromAssetDelivery(url, headers) {
+        if (!FLAGS.ASSETDELIVERY_V2 || !url.includes("assetdelivery.roblox.com/v2/")) return url;
+        const response = await (FLAGS.FETCH_FUNC || fetch)(FLAGS.API_REQUEST_PREFIX + url, {
+          headers: new Headers({ "Content-Type": "application/json", ...(headers || {}) }),
+        });
+        if (response.status !== 200) return response;
+        const data = await response.json();
+        return data.locations[0].location;
+      },
+    },
+  };
+  return { API, FLAGS };
+}
+
+const jsonOk = (body) => async () => new Response(JSON.stringify(body), {
+  status: 200,
+  headers: { "content-type": "application/json" },
+});
+
+test("Original wirft bei 200 ohne locations – der Ersatz liefert eine Response 502", async () => {
+  const errorsBody = { errors: [{ code: 401, message: "Authentication required to access Asset." }] };
+  const { API, FLAGS } = makeOriginalApi(jsonOk(errorsBody));
+
+  await assert.rejects(
+    () => API.Misc.getCDNURLFromAssetDelivery("https://assetdelivery.roblox.com/v2/asset?id=13576957688"),
+    TypeError,
+    "genau dieser TypeError stand als pageerror in den Produktions-Logs",
+  );
+
+  assert.equal(patchGetCDNURLFromAssetDelivery(API, FLAGS), true);
+  const result = await API.Misc.getCDNURLFromAssetDelivery("https://assetdelivery.roblox.com/v2/asset?id=13576957688");
+  assert.ok(result instanceof Response, "kein Throw mehr, sondern eine auswertbare Response");
+  assert.equal(result.status, 502);
+  assert.deepEqual(await result.json(), errorsBody, "Original-Body bleibt für die Diagnose erhalten");
+});
+
+test("Ersatz bedient locations[0].location UND das Singular-Schema location", async () => {
+  const location = "https://contentdelivery.roblox.com/v1/bytes/sc2/abc?__token__=exp=1~acl=%2f*~hmac=ff";
+  for (const body of [{ locations: [{ assetFormat: "source", location }] }, { location }]) {
+    const { API, FLAGS } = makeOriginalApi(jsonOk(body));
+    patchGetCDNURLFromAssetDelivery(API, FLAGS);
+    assert.equal(await API.Misc.getCDNURLFromAssetDelivery("https://assetdelivery.roblox.com/v2/asset?id=1"), location);
+  }
+});
+
+test("Ersatz reicht Nicht-200-Antworten unverändert durch und lässt Nicht-v2-URLs in Ruhe", async () => {
+  const unauthorized = new Response("nope", { status: 401 });
+  const { API, FLAGS } = makeOriginalApi(async () => unauthorized);
+  patchGetCDNURLFromAssetDelivery(API, FLAGS);
+
+  const result = await API.Misc.getCDNURLFromAssetDelivery("https://assetdelivery.roblox.com/v2/asset?id=1");
+  assert.equal(result, unauthorized, "Status ≠ 200 ⇒ Response zurück (die Guards machen daraus „HTTP 401“)");
+
+  // rbxcdn-/lokale URLs dürfen nicht angefasst werden.
+  const passthrough = "https://contentdelivery.roblox.com/v1/bytes/sc2/abc?__token__=x";
+  assert.equal(await API.Misc.getCDNURLFromAssetDelivery(passthrough), passthrough);
+  assert.equal(await API.Misc.getCDNURLFromAssetDelivery("/assets/RigR15.rbxm"), "/assets/RigR15.rbxm");
+});
+
+test("Ersatz übersteht kaputtes JSON mit 200 (kein Throw, sondern Response 502)", async () => {
+  const { API, FLAGS } = makeOriginalApi(async () => new Response("<html>maintenance</html>", {
+    status: 200,
+    headers: { "content-type": "text/html" },
+  }));
+  patchGetCDNURLFromAssetDelivery(API, FLAGS);
+  const result = await API.Misc.getCDNURLFromAssetDelivery("https://assetdelivery.roblox.com/v2/asset?id=1");
+  assert.ok(result instanceof Response);
+  assert.equal(result.status, 502);
+});
+
+test("patchGetCDNURLFromAssetDelivery ignoriert unpassende Objekte", () => {
+  assert.equal(patchGetCDNURLFromAssetDelivery(null, {}), false);
+  assert.equal(patchGetCDNURLFromAssetDelivery({}, {}), false);
+  assert.equal(patchGetCDNURLFromAssetDelivery({ Misc: {} }, {}), false);
 });

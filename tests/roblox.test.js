@@ -23,6 +23,21 @@ test("Proxy erlaubt ausschließlich Roblox Asset-Hosts über HTTPS", () => {
   assert.equal(isAllowedRobloxAssetUrl("https://example.com/a"), false);
 });
 
+test("contentdelivery.roblox.com ist erlaubt – dort liegen die OpenCloud-Locations", () => {
+  // Produktions-Log (2026-08-21, Deploy mit PR #15), pro Asset zweimal:
+  //   [proxy] OpenCloud-Location mit unerlaubtem Host contentdelivery.roblox.com:
+  //   HTTP 200, https://contentdelivery.roblox.com/v1/bytes/sc2/<hash>?__token__=… – nächster Versuch
+  assert.equal(
+    isAllowedRobloxAssetUrl("https://contentdelivery.roblox.com/v1/bytes/sc2/2ff1f4f1?__token__=exp=1755777777~acl=%2f*~hmac=deadbeef"),
+    true,
+  );
+  // Exakter Host-Vergleich: Suffix-/Präfix-Tricks bleiben verboten.
+  assert.equal(isAllowedRobloxAssetUrl("https://evil-contentdelivery.roblox.com.attacker.com/v1/bytes/sc2/x"), false);
+  assert.equal(isAllowedRobloxAssetUrl("https://contentdelivery.roblox.com.attacker.com/v1/bytes/sc2/x"), false);
+  assert.equal(isAllowedRobloxAssetUrl("https://evilcontentdelivery.roblox.com/v1/bytes/sc2/x"), false);
+  assert.equal(isAllowedRobloxAssetUrl("http://contentdelivery.roblox.com/v1/bytes/sc2/x"), false);
+});
+
 test("extractOpenCloudAssetLocation liest PascalCase- und camelCase-Antworten", () => {
   assert.equal(
     extractOpenCloudAssetLocation({ Location: "https://t1.rbxcdn.com/pascal", RequestId: "request-1" }),

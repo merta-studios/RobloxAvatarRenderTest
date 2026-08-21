@@ -25,9 +25,23 @@ export async function resolveRobloxUser(username, signal) {
   return { id: Number(user.id), name: user.name, displayName: user.displayName };
 }
 
+/**
+ * Hosts, die der Proxy laden darf. `contentdelivery.roblox.com` steht hier,
+ * weil die OpenCloud Asset-Delivery-API (apis.roblox.com) ihre signierten
+ * Locations real auf diesem Host ausliefert:
+ *
+ *   https://contentdelivery.roblox.com/v1/bytes/sc2/<hash>?__token__=exp=…~acl=…~hmac=…
+ *
+ * Ohne diesen Eintrag verwarf der Proxy JEDE erfolgreiche OpenCloud-Antwort
+ * („OpenCloud-Location mit unerlaubtem Host contentdelivery.roblox.com:
+ * HTTP 200 … – nächster Versuch“) und fiel auf den öffentlichen Endpunkt
+ * zurück, der für UGC nichts Lieferbares hat. Genau das ließ Shirt, Hose und
+ * Community-Accessoires trotz gültigem API-Key fehlen.
+ */
 const allowedHosts = new Set([
   "avatar.roblox.com",
   "assetdelivery.roblox.com",
+  "contentdelivery.roblox.com",
   "users.roblox.com",
   "apis.roblox.com",
 ]);

@@ -54,6 +54,14 @@ test("Renderer nutzt lokale Bibliotheks-Assets statt der cookie-pflichtigen Onli
   assert.match(client, /BUILD_ID/);
 });
 
+test("Renderer ersetzt getCDNURLFromAssetDelivery (Safety-Net gegen 200 ohne locations)", () => {
+  const client = readFileSync(new URL("src/renderer-client.js", root), "utf8");
+  // Der TypeError „Cannot read properties of undefined (reading '0')“ entsteht
+  // IM Original der Bibliothek – ein Wrapper könnte ihn nicht abfangen, weil
+  // die Promise-Kette der Bibliothek keinen catch hat. Deshalb Ersatz.
+  assert.match(client, /patchGetCDNURLFromAssetDelivery\(API, FLAGS\)/);
+});
+
 test("alle statischen roavatar-Assets sind im Repo vorhanden", () => {
   const required = [
     "public/assets/RigR15.rbxm",
