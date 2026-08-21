@@ -70,13 +70,18 @@ test("alle statischen roavatar-Assets sind im Repo vorhanden", () => {
   }
 });
 
-test("Server legt Build-Kennung, Diagnose-Logs und SKIP_DISCORD offen", () => {
+test("Server legt Build-Kennung, Diagnose-Logs, OpenCloud-Status und SKIP_DISCORD offen", () => {
   const server = readFileSync(new URL("src/server.js", root), "utf8");
   assert.match(server, /build: getBuildInfo\(\)/);
+  assert.match(server, /openCloud:\s*\{\s*configured: Boolean\(config\.openCloudApiKey\)/);
+  assert.match(server, /\[startup\] OpenCloud API-Key:/);
   assert.match(server, /config\.skipDiscord/);
   assert.match(server, /logRenderFailure/);
   assert.match(server, /\/render-debug/);
   assert.match(server, /roblox-assetformat/);
+
+  const renderConfig = readFileSync(new URL("render.yaml", root), "utf8");
+  assert.match(renderConfig, /key: ROBLOX_OPENCLOUD_API_KEY\s+sync: false/);
 });
 
 test("Renderer löst die lokalen Rig-Pfade deterministisch auf", () => {
@@ -163,12 +168,23 @@ test("fetchWithTimeout bricht nur die Header-Phase ab, nicht den Body-Stream", (
   assert.doesNotMatch(moduleSource, /AbortSignal\.timeout/);
 });
 
-test("Server-Proxy kennt den OpenCloud-Fallback für assetdelivery-401s", () => {
+test("Server-Proxy kennt OpenCloud-Location-JSON und Rohcontent-Fallback", () => {
   const server = readFileSync(new URL("src/server.js", root), "utf8");
   assert.match(server, /openCloudAssetDeliveryUrl/);
+  assert.match(server, /extractOpenCloudAssetLocation/);
+  assert.match(server, /inspectOpenCloudAssetResponse/);
+  assert.match(server, /opencloud-raw/);
   assert.match(server, /x-api-key/);
   assert.match(server, /config\.openCloudApiKey/);
   assert.match(server, /skippedAssets/);
+});
+
+test("Server-Proxy leitet nach automatischer undici-Dekompression keine falsche Content-Length weiter", () => {
+  const server = readFileSync(new URL("src/server.js", root), "utf8");
+  assert.match(server, /undici dekomprimiert gzip\/br\/deflate automatisch/);
+  assert.match(server, /for \(const header of \["content-type", "etag", "last-modified"\]\)/);
+  assert.doesNotMatch(server, /for \(const header of \[[^\]]*"content-length"/);
+  assert.match(server, /received > config\.maxProxyBytes/);
 });
 
 test("Discord-Fehlermeldung enthält Diagnose (Build, fehlgeschlagene Requests, Console)", () => {
