@@ -21,7 +21,14 @@ import { getBuildInfo } from "./build-info.js";
 import { commands } from "./commands.js";
 import { config, validateBotConfig } from "./config.js";
 import { createDiscordNet } from "./discord-net.js";
-import { isAllowedRobloxAssetUrl, openCloudAssetDeliveryUrl, resolveRobloxUser, RobloxError } from "./roblox.js";
+import {
+  extractOpenCloudAssetLocation,
+  inspectOpenCloudAssetResponse,
+  isAllowedRobloxAssetUrl,
+  openCloudAssetDeliveryUrl,
+  resolveRobloxUser,
+  RobloxError,
+} from "./roblox.js";
 
 const dnsOrder = process.env.DNS_RESULT_ORDER === "verbatim" ? "verbatim" : "ipv4first";
 setDefaultResultOrder(dnsOrder);
@@ -208,6 +215,9 @@ app.get("/health", (_request, response) => {
     busy,
     job: activeJob,
     uptime: Math.round(process.uptime()),
+    openCloud: {
+      configured: Boolean(config.openCloudApiKey),
+    },
     discord: {
       ready: discordReady,
       status: botState.status,
@@ -230,10 +240,19 @@ async function fetchAllowedRobloxUrl(initialUrl, signal, extraHeaders = {}) {
   let currentUrl = initialUrl;
   for (let redirects = 0; redirects <= 4; redirects += 1) {
     if (!isAllowedRobloxAssetUrl(currentUrl)) throw new Error("Unerlaubtes Redirect-Ziel");
+    const currentHost = new URL(currentUrl).hostname;
+    const requestHeaders = { "user-agent": "AvatarRenderTest/1.0", ...extraHeaders };
+    // Bei einer direkten OpenCloud-Weiterleitung zum CDN darf der API-Key den
+    // apis.roblox.com-Origin nicht verlassen.
+    if (currentHost !== "apis.roblox.com") {
+      for (const name of Object.keys(requestHeaders)) {
+        if (name.toLowerCase() === "x-api-key") delete requestHeaders[name];
+      }
+    }
     const result = await fetch(currentUrl, {
       redirect: "manual",
       signal,
-      headers: { "user-agent": "AvatarRenderTest/1.0", ...extraHeaders },
+      headers: requestHeaders,
     });
     if (result.status < 300 || result.status >= 400) return result;
     const location = result.headers.get("location");
@@ -241,6 +260,45 @@ async function fetchAllowedRobloxUrl(initialUrl, signal, extraHeaders = {}) {
     currentUrl = new URL(location, currentUrl).href;
   }
   throw new Error("Zu viele Redirects");
+}
+
+function compactBodySnippet(value, maxChars = 200) {
+  return String(value || "").replace(/\s+/g, " ").trim().slice(0, maxChars);
+}
+
+async function readResponseBodySnippet(response, maxChars = 200) {
+  try {
+    const reader = response.clone().body?.getReader();
+    if (!reader) return "";
+    const decoder = new TextDecoder();
+    let text = "";
+    while (text.length < maxChars) {
+      const { done, value } = await reader.read();
+      if (done) {
+        text += decoder.decode();
+        break;
+      }
+      text += decoder.decode(value, { stream: true });
+    }
+    if (text.length >= maxChars) void reader.cancel().catch(() => {});
+    return compactBodySnippet(text, maxChars);
+  } catch (error) {
+    return `<Body nicht lesbar: ${error?.message || String(error)}>`;
+  }
+}
+
+function getOpenCloudErrors(json) {
+  if (!json || typeof json !== "object" || Array.isArray(json)) return null;
+  return Object.entries(json).find(([key]) => key.toLowerCase() === "errors")?.[1] ?? null;
+}
+
+function formatOpenCloudErrors(errors) {
+  if (errors == null) return "–";
+  try { return JSON.stringify(errors).slice(0, 500); } catch { return String(errors).slice(0, 500); }
+}
+
+function urlHost(rawUrl) {
+  try { return new URL(rawUrl).host; } catch { return "<ungültige URL>"; }
 }
 
 /**
@@ -265,21 +323,37 @@ async function fetchUpstreamWithFallbacks(url, extraHeaders, controller) {
           ...extraHeaders,
           "x-api-key": config.openCloudApiKey,
         });
-        if (apiResponse.ok) {
-          const data = await apiResponse.json().catch(() => null);
-          const location = data?.location || data?.locations?.[0]?.location;
-          if (location && isAllowedRobloxAssetUrl(location)) {
+        const inspected = await inspectOpenCloudAssetResponse(apiResponse);
+        if (inspected.kind === "raw") {
+          // Manche Varianten liefern den Asset-Body direkt statt eines
+          // Location-JSON. inspectOpenCloudAssetResponse liest nur einen Clone,
+          // daher bleibt dieser Body für den Proxy-Stream unangetastet.
+          if (apiResponse.ok && apiResponse.body) {
+            log(`[proxy] OpenCloud-Rohcontent: HTTP ${apiResponse.status}, content-type=${inspected.contentType || "?"}, Grund=${inspected.reason}, ${openCloudUrl.slice(0, 140)}`);
+            return { upstream: apiResponse, via: "opencloud-raw" };
+          }
+          const bodySnippet = inspected.bodyText
+            ? compactBodySnippet(inspected.bodyText)
+            : await readResponseBodySnippet(apiResponse);
+          log(`[proxy] OpenCloud ohne JSON-Asset: HTTP ${apiResponse.status}, content-type=${inspected.contentType || "?"}, Grund=${inspected.reason}, body="${bodySnippet}", ${openCloudUrl.slice(0, 140)} – Fallback auf assetdelivery`);
+        } else {
+          const location = extractOpenCloudAssetLocation(inspected.json);
+          if (location && !isAllowedRobloxAssetUrl(location)) {
+            log(`[proxy] OpenCloud-Location mit unerlaubtem Host ${urlHost(location)}: HTTP ${apiResponse.status}, ${location.slice(0, 140)} – Fallback auf assetdelivery`);
+          } else if (apiResponse.ok && location) {
             const content = await fetchAllowedRobloxUrl(location, controller.signal, extraHeaders);
             if (content.ok && content.body) {
               log(`[proxy] OpenCloud: ${url.slice(0, 140)} → ${location.slice(0, 100)}`);
               return { upstream: content, via: "opencloud" };
             }
             log(`[proxy] OpenCloud-Location HTTP ${content.status}: ${location.slice(0, 140)}`);
+          } else if (!location) {
+            const errors = getOpenCloudErrors(inspected.json);
+            const bodySnippet = compactBodySnippet(inspected.bodyText);
+            log(`[proxy] OpenCloud ohne Location: HTTP ${apiResponse.status}, content-type=${inspected.contentType || "?"}, body="${bodySnippet}", Errors=${formatOpenCloudErrors(errors)}, ${openCloudUrl.slice(0, 140)} – Fallback auf assetdelivery`);
           } else {
-            log(`[proxy] OpenCloud ohne location-Feld: ${openCloudUrl.slice(0, 140)}`);
+            log(`[proxy] OpenCloud HTTP ${apiResponse.status} trotz Location, content-type=${inspected.contentType || "?"}: ${location.slice(0, 140)} – Fallback auf assetdelivery`);
           }
-        } else {
-          log(`[proxy] OpenCloud HTTP ${apiResponse.status} ${openCloudUrl.slice(0, 140)} – Fallback auf assetdelivery`);
         }
       } catch (error) {
         reportError("[proxy] OpenCloud-Fallback", error);
@@ -330,7 +404,11 @@ app.get("/roblox-proxy", async (request, response) => {
     if (declaredSize > config.maxProxyBytes) return response.status(413).json({ error: "Asset zu groß" });
 
     response.status(upstream.status);
-    for (const header of ["content-type", "content-length", "etag", "last-modified"]) {
+    // Node/undici dekomprimiert gzip/br/deflate automatisch, lässt aber den
+    // ursprünglichen Content-Length-Header stehen. Diese komprimierte Länge
+    // darf nicht für den dekomprimierten Proxy-Body weitergereicht werden.
+    // Der Stream-Limiter unten prüft weiterhin die tatsächlich gelesenen Bytes.
+    for (const header of ["content-type", "etag", "last-modified"]) {
       const value = upstream.headers.get(header);
       if (value) response.setHeader(header, value);
     }
@@ -952,6 +1030,7 @@ const server = app.listen(config.port, "0.0.0.0", () => {
   const build = getBuildInfo();
   log(`[http] HTTP: Port ${config.port} (Healthcheck: /health).`);
   log(`[startup] Build ${build.id} git=${build.gitCommit} branch=${build.gitBranch} node=${build.node}.`);
+  log(`[startup] OpenCloud API-Key: ${config.openCloudApiKey ? "konfiguriert" : "nicht konfiguriert"}.`);
   if (config.skipDiscord) {
     botState.status = "skipped";
     log("[startup] SKIP_DISCORD=true – Discord-Login übersprungen, Render-Pfad bleibt aktiv.");

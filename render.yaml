@@ -13,6 +13,8 @@ services:
         sync: false
       - key: DISCORD_GUILD_ID
         sync: false
+      - key: ROBLOX_OPENCLOUD_API_KEY
+        sync: false
       - key: RENDER_TIMEOUT_SECONDS
         value: "420"
       - key: MAX_ASSET_MB

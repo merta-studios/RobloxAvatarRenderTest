@@ -121,7 +121,7 @@ Siehe `.env.example`.
 | `DNS_RESULT_ORDER` | nein | `ipv4first` | DNS-Reihenfolge: `ipv4first` (Standard) behebt Verbindungs-Hänger in Containern ohne IPv6-Route; `verbatim` nutzt die System-Reihenfolge |
 | `HEALTH_REQUIRE_DISCORD` | nein | `false` | Wenn `true`, antwortet `/health` mit 503, solange der Bot nicht mit Discord verbunden ist |
 | `DISCORD_DEBUG` | nein | `false` | Ausführliche Debug-Logs von discord.js (REST/WebSocket) |
-| `ROBLOX_OPENCLOUD_API_KEY` | nein | – | OpenCloud-API-Key (erstellen unter <https://create.roblox.com/dashboard/credentials>, „legacy-asset:manage“ ist nicht nötig – ein Key eines beliebigen Users reicht für öffentliche Assets). Ohne Key werden UGC-Assets, die Roblox unauthentifiziert nicht mehr ausliefert (HTTP 401), übersprungen; mit Key lädt der Proxy sie über `apis.roblox.com/asset-delivery-api` nach. Kein Roblox-Cookie! |
+| `ROBLOX_OPENCLOUD_API_KEY` | nein | – | OpenCloud-API-Key (erstellen unter <https://create.roblox.com/dashboard/credentials>) mit dem Scope **`legacy-asset:manage`**. Ohne Key bzw. Scope werden Assets, die Roblox unauthentifiziert nicht ausliefert (HTTP 401), übersprungen; mit korrekt berechtigtem Key lädt der Proxy sie über `apis.roblox.com/asset-delivery-api` nach. Kein Roblox-Cookie! |
 
 ## Startreihenfolge, Timeouts und Diagnose
 
@@ -139,7 +139,7 @@ Gateway-Ereignisse (Reconnect, Disconnect, Shard-Fehler, Warnungen) werden unter
 
 Standardmäßig startet der Prozess mit `dns.setDefaultResultOrder("ipv4first")` und schaltet Node's „Happy Eyeballs“-Versuch ab (`net.setDefaultAutoSelectFamily(false)`, wieder aktivierbar über `AUTO_SELECT_FAMILY=true`). In Containern ohne IPv6-Route verhindert das bekannte Verbindungs-Hänger zum Discord-Gateway (Node 22 versucht sonst zuerst IPv6). Über `DNS_RESULT_ORDER=verbatim` lässt sich auf die System-Reihenfolge umschalten.
 
-**Healthcheck:** `GET /health` liefert standardmäßig **200**, sobald der HTTP-Server läuft – auch während der Bot noch auf Discord wartet. Das ist Absicht: Ein 503 lässt Render den Container töten und erzeugt eine Neustart-Schleife, in der der Bot nie online kommt. Mit `HEALTH_REQUIRE_DISCORD=true` antwortet `/health` wie früher mit 503, solange Discord nicht verbunden ist. Die Antwort enthält den Discord-Status (User, Ping, Gateway, letzter Fehler) sowie den Stand der Command-Registrierung:
+**Healthcheck:** `GET /health` liefert standardmäßig **200**, sobald der HTTP-Server läuft – auch während der Bot noch auf Discord wartet. Das ist Absicht: Ein 503 lässt Render den Container töten und erzeugt eine Neustart-Schleife, in der der Bot nie online kommt. Mit `HEALTH_REQUIRE_DISCORD=true` antwortet `/health` wie früher mit 503, solange Discord nicht verbunden ist. Die Antwort enthält den Discord-Status (User, Ping, Gateway, letzter Fehler), den Stand der Command-Registrierung und unter `openCloud.configured` ausschließlich den Key-Status (niemals den Key selbst):
 
 ```json
 {
@@ -147,6 +147,7 @@ Standardmäßig startet der Prozess mit `dns.setDefaultResultOrder("ipv4first")`
   "busy": false,
   "job": null,
   "uptime": 42,
+  "openCloud": { "configured": true },
   "discord": { "ready": true, "status": "ready", "user": "MeinBot#0000", "ping": 41, "lastError": null, "lastLoginError": null },
   "commands": { "state": "registered", "target": "Guild 123", "count": 1, "durationMs": 812 }
 }
